@@ -1,0 +1,40 @@
+# ── Personal configuration (NEVER commit) ─────────────────────────────────────
+scripts/config.py
+.env
+
+# ── Runtime output (generated, not source) ───────────────────────────────────
+output/
+*.seen.json
+*.seen.json.*
+board_state.json
+flagged_for_review.json
+vacation_buffer.json
+radar_runs.db
+radar_runs.db-wal
+radar_runs.db-shm
+debug_job_log.txt
+*-report.md
+*-jobs.json
+*-skipped.json
+.company_cache.json
+filtered_log.json
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
