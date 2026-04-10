@@ -1,0 +1,2136 @@
+"""
+dashboard.py  -  Job Search Kanban Dashboard
+────────────────────────────────────────────────────────────────
+
+A lightweight local Flask dashboard that reads the daily *-jobs.json and
+*-skipped.json files written by job_radar.py and presents two views:
+
+  Board tab   - Kanban board with three columns (Reviewing, Applied, Interviewing)
+  Skipped tab - All auto-filtered jobs, with options to restore or flag for review
+
+USAGE
+  python scripts/dashboard.py   (or scripts\\dashboard.py on Windows)
+  Then open http://localhost:5000 in your browser.
+  Keep the terminal window open while using the dashboard.
+
+REQUIRES
+  pip install flask
+
+FILES
+  Reads:   output/job-radar/*-jobs.json          (written by job_radar.py)
+           output/job-radar/*-skipped.json        (written by job_radar.py)
+  Writes:  output/job-radar/board_state.json      (card positions, notes, rejections)
+           output/job-radar/flagged_for_review.json (jobs flagged for Claude to review)
+
+  All paths resolve from the project root (parent of scripts/) regardless of
+  which directory this file is run from — see _HERE/_ROOT constants below.
+
+BOARD COLUMNS
+  Reviewing    - New jobs from the radar (default landing column)
+  Applied      - Jobs you have submitted an application for
+  Interviewing - Active interview in progress
+
+SKIPPED TAB ACTIONS
+  Add to Reviewing  - Moves the job onto the main board Reviewing column
+  Flag for Review   - Saves to flagged_for_review.json with your note; upload
+                      this file to Claude after vacation for filter re-review
+  Delete (trash)    - Permanently hides the card from the skipped view
+
+SECURITY NOTES (from code review 2026-03-18)
+  - Job URLs use data-url attributes + openLinkSafe(), never injected into onclick
+  - Job data for flagging uses _skipJobMap (JS Map), not inline JSON in onclick
+  - _flagged_lock (threading.Lock) prevents race conditions on flagged file writes
+  - All paths use _HERE/_ROOT so the app works from any working directory
+
+PERSISTENCE
+  board_state.json is written atomically (tmp + os.replace) after every action.
+  All card positions, notes, applied dates, rejections, and flags survive restarts.
+"""
+
+import os
+import re
+import json
+import glob
+import sqlite3
+import threading
+from datetime import datetime
+from flask import Flask, jsonify, request, render_template_string, send_from_directory
+
+# FIX (code review 2026-03-18): api_flag and api_unflag both do read-modify-write
+# on flagged_for_review.json. Without a lock, two simultaneous requests (e.g. double-
+# click) could both read the old file, both modify it, and the second write would
+# silently discard the first change. _flagged_lock serialises all flagged file access.
+_flagged_lock = threading.Lock()
+
+# FIX (code review 2026-04-03): All board state routes do read-modify-write on
+# board_state.json. Flask's dev server is single-threaded by default, but newer
+# Flask versions may enable threading. _board_lock prevents concurrent writes
+# corrupting board_state.json under threaded execution.
+_board_lock = threading.Lock()
+
+app = Flask(__name__)
+
+# ── Simple TTL cache for job/skipped file reads ────────────────────────────────
+# FIX (code review): api_board() read all JSON files from disk on every page load
+# with no caching. At 30+ files/month after 6 months this adds measurable latency.
+# Cache the parsed job/skipped data for 30 seconds. Write actions invalidate it
+# so board state changes appear immediately without waiting for TTL expiry.
+import time as _time_module  # alias to avoid shadowing any local 'time' names
+
+_jobs_cache: dict = {"jobs": None, "ids": None, "at": 0.0}
+_skipped_cache: dict = {"jobs": None, "at": 0.0}
+_CACHE_TTL = 30  # seconds — radar only writes once/day so 30s is safe
+
+def _invalidate_job_cache():
+    """Call after any write that changes what jobs appear on the board."""
+    _jobs_cache["at"] = 0.0
+    _skipped_cache["at"] = 0.0
+
+def _cached_load_all_jobs():
+    now = _time_module.time()
+    if _jobs_cache["jobs"] is None or now - _jobs_cache["at"] > _CACHE_TTL:
+        jobs, ids = load_all_jobs()
+        _jobs_cache["jobs"] = jobs
+        _jobs_cache["ids"]  = ids
+        _jobs_cache["at"]   = now
+    return _jobs_cache["jobs"], _jobs_cache["ids"]
+
+def _cached_load_all_skipped():
+    now = _time_module.time()
+    if _skipped_cache["jobs"] is None or now - _skipped_cache["at"] > _CACHE_TTL:
+        _skipped_cache["jobs"] = load_all_skipped()
+        _skipped_cache["at"]   = now
+    return _skipped_cache["jobs"]
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+# FIX (code review 2026-03-18): All paths previously used relative strings like
+# "output/job-radar/..." which resolved relative to wherever the script was run
+# from. Running from scripts/ would look for scripts/output/... (wrong). Fixed
+# by using __file__ to find the script's actual location, then stepping up one
+# level to the project root. All 5 path constants now use os.path.join(_ROOT).
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+_ROOT        = os.path.dirname(_HERE)   # parent of scripts/
+
+JOBS_DIR     = os.path.join(_ROOT, "output", "job-radar")
+BOARD_STATE  = os.path.join(_ROOT, "output", "job-radar", "board_state.json")
+JOBS_GLOB    = os.path.join(_ROOT, "output", "job-radar", "*-jobs.json")
+SKIPPED_GLOB = os.path.join(_ROOT, "output", "job-radar", "*-skipped.json")
+FLAGGED_FILE = os.path.join(_ROOT, "output", "job-radar", "flagged_for_review.json")
+RADAR_DB     = os.path.join(_ROOT, "output", "job-radar", "radar_runs.db")
+
+COLUMNS = ["Reviewing", "Applied", "Interviewing"]
+
+
+# ── State helpers ──────────────────────────────────────────────────────────────
+
+def load_board_state():
+    """Load board state from disk. Returns dict keyed by job_id."""
+    if not os.path.exists(BOARD_STATE):
+        return {}
+    try:
+        with open(BOARD_STATE, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        # FIX (code review): previously silent. A corrupt board_state.json would
+        # silently reset all card positions to default with no user-facing indication.
+        app.logger.warning("load_board_state: corrupt file, starting fresh: %s", e)
+        return {}
+
+
+def save_board_state(state):
+    """Atomically write board state to disk.
+
+    FIX (code review): previously caught OSError and returned normally, causing
+    the calling route to return {"ok": True} even on disk failure. The card
+    would appear to move/reject/flag on screen but revert on next reload.
+    Now raises so callers can return a 500 to the client.
+
+    FIX (data integrity): validates that no entry has both rejected=True and
+    a column set simultaneously — that state is contradictory (a job cannot be
+    on the board and rejected at the same time). If found, rejected takes
+    precedence and column is cleared. This prevents ghost cards.
+    """
+    # Integrity check: rejected + column is contradictory — rejected wins
+    repaired = 0
+    for jid, s in state.items():
+        if s.get("rejected") and s.get("column"):
+            del s["column"]
+            repaired += 1
+    if repaired:
+        app.logger.warning("save_board_state: repaired %d entries with rejected+column conflict", repaired)
+
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    tmp = BOARD_STATE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, BOARD_STATE)
+
+
+def make_job_id(job):
+    """Stable ID from company + title — same job from multiple days stays one card.
+
+    MUST produce the same key as dedup_keys()/normalize_title() in job_radar.py
+    for the company|title path. If these diverge, a job rejected on the board
+    may reappear after seen.json expires (60 days) because the rejected state
+    is filed under a different key than the new entry.
+
+    Normalization mirrors job_radar.py normalize_title():
+      1. _TITLE_CLEANUP_RE strips trailing "- Remote, US", "- Hybrid", etc.
+      2. Parenthetical location words stripped: "(Remote)", "(US)", etc.
+      3. Trailing location suffix after " - " or " | " stripped if all location words.
+    """
+    company = (job.get("company") or "").strip().lower()
+    title   = (job.get("title")   or "").strip().lower()
+
+    # Step 1: strip trailing dash/pipe location suffix (e.g. "- Remote, US", "| Hybrid")
+    title = re.sub(
+        r"\s*[-–|]\s*(remote|remote,?\s*(us|usa)?|hybrid|onsite|on-site"
+        r"|united states?|us|usa|\w{2,3},\s*\w{2})\s*$",
+        "", title, flags=re.IGNORECASE,
+    ).strip()
+
+    # Step 2: strip parenthetical location words (e.g. "(Remote)", "(US)")
+    _location_words = {"remote", "us", "usa", "united states", "nationwide",
+                       "anywhere", "hybrid", "onsite", "on-site", "contract",
+                       "full-time", "full time", "part-time", "part time"}
+    title = re.sub(
+        r"\(([^)]*)\)",
+        lambda m: "" if m.group(1).strip().lower() in _location_words else m.group(0),
+        title,
+    ).strip()
+
+    # Step 3: strip trailing location segment after " - " or " | "
+    for sep in [" - ", " | "]:
+        if sep in title:
+            parts = title.split(sep)
+            suffix_words = set(re.split(r"[\s,]+", parts[-1]))
+            if suffix_words.issubset(_location_words):
+                title = sep.join(parts[:-1]).strip()
+
+    title = re.sub(r"\s+", " ", title).strip()
+    return f"{company}|{title}"
+
+
+def load_all_jobs():
+    """Read every *-jobs.json file, deduplicate by job_id, return list."""
+    seen_ids = {}
+    files = sorted(glob.glob(JOBS_GLOB), reverse=True)  # newest file wins on dedup
+    for path in files:
+        # Skip board_state.json if it ever matches the glob (it won't but safety first)
+        if "board_state" in path:
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                jobs = json.load(f)
+            for job in jobs:
+                jid = make_job_id(job)
+                if jid not in seen_ids:
+                    seen_ids[jid] = job
+        except (json.JSONDecodeError, OSError) as e:
+            # FIX (code review): previously silent. Now logs so the user knows
+            # why fewer jobs appear on the board than expected.
+            app.logger.warning("load_all_jobs: skipping corrupt file %s: %s", path, e)
+            continue
+
+    return list(seen_ids.values()), seen_ids
+
+
+def load_all_skipped():
+    """Read every *-skipped.json file, deduplicate by job_id, return list newest-first.
+    Uses 'entries' instead of 'jobs' for the per-file list to avoid shadowing the
+    outer scope variable name (Fix 6 from code review).
+    """
+    seen_ids = {}
+    files = sorted(glob.glob(SKIPPED_GLOB), reverse=True)
+    for path in files:
+        try:
+            with open(path, encoding="utf-8") as f:
+                # FIX (code review 2026-03-18): Originally used 'jobs = json.load(f)'
+                # which shadowed a common outer-scope variable name. Renamed to 'entries'.
+                entries = json.load(f)
+            for job in entries:
+                jid = make_job_id(job)
+                if jid not in seen_ids:
+                    seen_ids[jid] = job
+        except (json.JSONDecodeError, OSError) as e:
+            app.logger.warning("load_all_skipped: skipping corrupt file %s: %s", path, e)
+            continue
+    # Sort newest date_found first
+    result = list(seen_ids.values())
+    result.sort(key=lambda j: j.get("date_found", ""), reverse=True)
+    return result
+
+
+def build_board(jobs, state):
+    """
+    Merge jobs with their board state.
+    Returns dict: { column_name: [job_with_state, ...] }
+    Rejected jobs are excluded entirely.
+    New jobs (not yet in state) land in 'Reviewing'.
+    """
+    columns = {col: [] for col in COLUMNS}
+
+    for job in jobs:
+        jid = make_job_id(job)
+        card_state = state.get(jid, {})
+
+        if card_state.get("rejected"):
+            continue  # permanently hidden
+
+        column = card_state.get("column", "Reviewing")
+        if column not in COLUMNS:
+            column = "Reviewing"
+
+        enriched = dict(job)
+        enriched["id"]          = jid
+        enriched["column"]      = column
+        enriched["applied_date"]= card_state.get("applied_date", "")
+        enriched["flagged"]     = card_state.get("flagged", False)
+
+        # Nice salary display
+        sal_min = job.get("salary_min")
+        sal_max = job.get("salary_max")
+        sal_ext = job.get("salary_extracted")
+        if sal_min and sal_max and sal_min > 30000:
+            enriched["salary_display"] = f"${sal_min:,.0f} – ${sal_max:,.0f}"
+        elif sal_ext:
+            enriched["salary_display"] = sal_ext
+        else:
+            enriched["salary_display"] = ""
+
+        columns[column].append(enriched)
+
+    # Reviewing: tier priority first (Perfect Fit -> Good Fit -> Worth a Look),
+    # then newest date_found first within each tier so today's jobs float to top.
+    # Date strings are YYYY-MM-DD so we can negate lexical order with a minus sign
+    # trick: sort by (tier_asc, date_desc) using a secondary reverse on date only.
+    # Cleanest approach: sort with a key that uses tier ascending, date descending.
+    tier_order = {"Perfect Fit": 0, "Good Fit": 1, "Worth a Look": 2}
+
+    def _reviewing_key(j):
+        tier = tier_order.get(j.get("tier", ""), 9)
+        # Negate date lexically by inverting each character's ordinal value.
+        # "2026-03-18" > "2026-03-17" so inverting makes newer dates sort first.
+        # FIX (code review): validate the date is a well-formed YYYY-MM-DD ISO string
+        # before inverting. Malformed dates (empty, "today", "2026/04/03") would
+        # sort unpredictably. Fall back to "0000-00-00" on any format mismatch.
+        date_str = j.get("date_found", "") or ""
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str):
+            date_str = "0000-00-00"
+        date_neg = tuple(255 - ord(c) for c in date_str)
+        return (tier, date_neg)
+
+    columns["Reviewing"].sort(key=_reviewing_key)
+
+    for col in ("Applied", "Interviewing"):
+        columns[col].sort(
+            key=lambda j: j.get("applied_date", "") or j.get("date_found", ""),
+            reverse=True,
+        )
+
+    return columns
+
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index():
+    return render_template_string(BOARD_HTML)
+
+
+@app.route("/api/board")
+def api_board():
+    jobs, jobs_by_id = _cached_load_all_jobs()
+    state            = load_board_state()
+
+    # FIX: Skipped jobs that were restored via "Add to Reviewing" live in
+    # *-skipped.json files, not *-jobs.json. load_all_jobs() never reads them,
+    # so restored jobs never appeared on the board. Fix: find any board_state
+    # entry marked as restored and not already in jobs_by_id, then pull its
+    # data from the skipped files and inject it into the jobs list.
+    restored_ids = {
+        jid for jid, s in state.items()
+        if s.get("restored") and s.get("column") and jid not in jobs_by_id
+    }
+    if restored_ids:
+        skipped_by_id = {make_job_id(j): j for j in _cached_load_all_skipped()}
+        for jid in restored_ids:
+            if jid in skipped_by_id:
+                jobs.append(skipped_by_id[jid])
+
+    board  = build_board(jobs, state)
+    total  = sum(len(v) for v in board.values())
+    return jsonify({
+        "columns": board,
+        "total":   total,
+        "last_updated": datetime.now().strftime("%b %d, %Y at %I:%M %p"),
+    })
+
+
+@app.route("/api/move", methods=["POST"])
+def api_move():
+    """Move a card to a different column."""
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+    column = data.get("column")
+
+    if not job_id or column not in COLUMNS:
+        return jsonify({"error": "invalid"}), 400
+
+    with _board_lock:
+        state = load_board_state()
+        if job_id not in state:
+            state[job_id] = {}
+        state[job_id]["column"] = column
+        if column == "Applied" and not state[job_id].get("applied_date"):
+            state[job_id]["applied_date"] = datetime.now().strftime("%Y-%m-%d")
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_move save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/reject", methods=["POST"])
+def api_reject():
+    """Permanently hide a card from the board."""
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+
+    if not job_id:
+        return jsonify({"error": "invalid"}), 400
+
+    with _board_lock:
+        state = load_board_state()
+        if job_id not in state:
+            state[job_id] = {}
+        state[job_id]["rejected"] = True
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_reject save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/unreject", methods=["POST"])
+def api_unreject():
+    """Undo a reject — restore a card to the board.
+    Clears the rejected flag so the card reappears in its previous column.
+    Called by the persistent ↩ Undo delete button in the header.
+    """
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+    if not job_id:
+        return jsonify({"error": "invalid"}), 400
+    with _board_lock:
+        state = load_board_state()
+        if job_id in state:
+            state[job_id]["rejected"] = False
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_unreject save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    return jsonify({"ok": True})
+
+
+
+
+@app.route("/api/skipped")
+def api_skipped():
+    """Return all skipped jobs, excluding ones the user has already dismissed or restored."""
+    skipped  = _cached_load_all_skipped()
+    state    = load_board_state()
+    # Exclude jobs the user has dismissed from skipped view, or already restored to board
+    filtered = []
+    for job in skipped:
+        jid        = make_job_id(job)
+        card_state = state.get(jid, {})
+        if card_state.get("skip_dismissed") or card_state.get("column"):
+            continue  # hidden or already on board
+        filtered.append({**job, "id": jid, "flagged": card_state.get("flagged", False)})
+    return jsonify({
+        "jobs": filtered,
+        "total": len(filtered),
+        "last_updated": datetime.now().strftime("%b %d, %Y at %I:%M %p"),
+    })
+
+
+@app.route("/api/skip_dismiss", methods=["POST"])
+def api_skip_dismiss():
+    """Permanently hide a skipped job from the skipped view."""
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+    if not job_id:
+        app.logger.warning("api_skip_dismiss: missing id in payload: %s", data)
+        return jsonify({"error": "invalid", "detail": "missing id"}), 400
+    with _board_lock:
+        state = load_board_state()
+        if job_id not in state:
+            state[job_id] = {}
+        state[job_id]["skip_dismissed"] = True
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_skip_dismiss save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    app.logger.info("api_skip_dismiss: dismissed job_id=%r", job_id)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/restore", methods=["POST"])
+def api_restore():
+    """Move a skipped job onto the Reviewing column of the main board."""
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+    if not job_id:
+        return jsonify({"error": "invalid"}), 400
+    with _board_lock:
+        state = load_board_state()
+        if job_id not in state:
+            state[job_id] = {}
+        state[job_id]["column"]   = "Reviewing"
+        state[job_id]["restored"] = True
+        # FIX (code review 2026-03-18): Previously also set skip_dismissed=False here,
+        # but api_skipped filters restored jobs by checking card_state.get("column"),
+        # not by skip_dismissed. Setting it False was dead code that added confusion.
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_restore save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    _invalidate_job_cache()  # restored job must appear on next board load
+    return jsonify({"ok": True})
+
+
+@app.route("/api/flag", methods=["POST"])
+def api_flag():
+    """Flag a skipped job for Claude to re-review. Writes to flagged_for_review.json.
+    _flagged_lock prevents concurrent writes corrupting the file on double-click."""
+    data    = request.get_json(silent=True) or {}
+    job_id  = data.get("id")
+    note    = data.get("note", "")
+    job_data= data.get("job", {})
+    if not job_id:
+        return jsonify({"error": "invalid"}), 400
+
+    with _flagged_lock:
+        flagged = []
+        if os.path.exists(FLAGGED_FILE):
+            try:
+                with open(FLAGGED_FILE, encoding="utf-8") as f:
+                    flagged = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                flagged = []
+
+        existing_ids = {entry.get("id") for entry in flagged}
+        if job_id not in existing_ids:
+            flagged.append({
+                "id":         job_id,
+                "title":      job_data.get("title", ""),
+                "company":    job_data.get("company", ""),
+                "url":        job_data.get("url", ""),
+                "reason":     job_data.get("reason", ""),
+                "date_found": job_data.get("date_found", ""),
+                "user_note": note,
+                "flagged_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            })
+            os.makedirs(JOBS_DIR, exist_ok=True)
+            tmp = FLAGGED_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(flagged, f, indent=2)
+            os.replace(tmp, FLAGGED_FILE)
+
+    with _board_lock:
+        state = load_board_state()
+        if job_id not in state:
+            state[job_id] = {}
+        state[job_id]["flagged"] = True
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_flag save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/unflag", methods=["POST"])
+def api_unflag():
+    """Remove a flag from a skipped job.
+    _flagged_lock prevents concurrent writes corrupting the file."""
+    data   = request.get_json(silent=True) or {}
+    job_id = data.get("id")
+    if not job_id:
+        return jsonify({"error": "invalid"}), 400
+
+    with _flagged_lock:
+        if os.path.exists(FLAGGED_FILE):
+            try:
+                with open(FLAGGED_FILE, encoding="utf-8") as f:
+                    flagged = json.load(f)
+                flagged = [entry for entry in flagged if entry.get("id") != job_id]
+                tmp = FLAGGED_FILE + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(flagged, f, indent=2)
+                os.replace(tmp, FLAGGED_FILE)
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    with _board_lock:
+        state = load_board_state()
+        if job_id in state:
+            state[job_id]["flagged"] = False
+        try:
+            save_board_state(state)
+        except OSError as e:
+            app.logger.error("api_unflag save_board_state failed: %s", e)
+            return jsonify({"error": "disk write failed"}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/health")
+def api_health():
+    """Return radar run history from SQLite for the Health tab.
+    Returns the last 30 runs with per-source stats and filter breakdown.
+    Returns empty runs list if DB does not exist yet (no runs completed).
+    """
+    if not os.path.exists(RADAR_DB):
+        return jsonify({"runs": [], "sources": [], "last_updated": None})
+
+    try:
+        conn = sqlite3.connect(RADAR_DB, timeout=5)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")  # allows concurrent reads during radar writes
+
+        runs_raw = conn.execute(
+            "SELECT * FROM radar_runs ORDER BY id DESC LIMIT 90"
+        ).fetchall()
+
+        runs = []
+        for run in runs_raw:
+            run_id = run["id"]
+
+            sources = [dict(r) for r in conn.execute(
+                "SELECT source, raw_count, new_count, latency_ms "
+                "FROM source_stats WHERE run_id=? ORDER BY raw_count DESC",
+                (run_id,),
+            ).fetchall()]
+
+            filters = [dict(r) for r in conn.execute(
+                "SELECT reason, count FROM filter_stats WHERE run_id=? ORDER BY count DESC",
+                (run_id,),
+            ).fetchall()]
+
+            runs.append({
+                "id":           run_id,
+                "started_at":   run["started_at"],
+                "finished_at":  run["finished_at"],
+                "total_raw":    run["total_raw"],
+                "total_new":    run["total_new"],
+                "total_rated":  run["total_rated"],
+                "report_file":  run["report_file"],
+                "sources":      sources,
+                "filters":      filters,
+            })
+
+        conn.close()
+
+        # Collect all source names seen across all runs for table headers
+        all_sources = sorted({s["source"] for r in runs for s in r["sources"]})
+
+        return jsonify({
+            "runs":         runs,
+            "sources":      all_sources,
+            "last_updated": runs[0]["finished_at"] if runs else None,
+        })
+
+    except Exception as e:
+        app.logger.error("api_health error: %s", e)
+        return jsonify({"error": str(e), "runs": [], "sources": []}), 500
+# Single-file design — no separate template directory needed.
+
+BOARD_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Job Search Board</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Sans:wght@300;400;500;600&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0f0f12;
+    --surface:   #17171c;
+    --surface2:  #1f1f27;
+    --border:    rgba(255,255,255,.07);
+    --text:      #e8e6f0;
+    --muted:     #7b7a8e;
+    --accent:    #7c6af5;
+    --accent2:   #b49ef7;
+    --perfect:   #f0c060;
+    --good:      #6fcf8a;
+    --look:      #63aadf;
+    --applied:   #a78bfa;
+    --interview: #f97316;
+    --danger:    #e05a5a;
+    --skipped:   #6b7280;
+    --flagged:   #f59e0b;
+    --col-w:     360px;
+    --radius:    12px;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 14px;
+    min-height: 100vh;
+    overflow-x: auto;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 32px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    gap: 20px;
+  }
+
+  .logo {
+    font-family: 'DM Serif Display', serif;
+    font-size: 22px;
+    letter-spacing: -.3px;
+    color: var(--text);
+    flex-shrink: 0;
+  }
+  .logo span { color: var(--accent2); font-style: italic; }
+
+  .header-stats {
+    display: flex;
+    gap: 20px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .stat-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+  .stat-chip strong {
+    color: var(--text);
+    font-weight: 600;
+    font-size: 15px;
+  }
+  .stat-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+  }
+
+  /* ── Tab nav ── */
+  .tab-nav {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    border-radius: 8px;
+    padding: 6px 14px;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+  .tab-btn:hover { border-color: rgba(255,255,255,.18); color: var(--text); }
+  .tab-btn.active {
+    background: rgba(124,106,245,.15);
+    border-color: rgba(124,106,245,.4);
+    color: var(--accent2);
+  }
+  .tab-btn.tab-skipped.active {
+    background: rgba(107,114,128,.12);
+    border-color: rgba(107,114,128,.35);
+    color: #9ca3af;
+  }
+
+  .badge {
+    background: var(--surface2);
+    border-radius: 10px;
+    padding: 1px 7px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+  }
+  .tab-btn.active .badge { background: rgba(255,255,255,.08); color: var(--text); }
+
+  /* Persistent undo button — appears in header after a delete, stays until used */
+  .undo-btn {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    background: rgba(224, 90, 90, 0.12);
+    border: 1px solid rgba(224, 90, 90, 0.4);
+    color: #e05a5a;
+    border-radius: 6px;
+    padding: 5px 12px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .undo-btn:hover { background: rgba(224, 90, 90, 0.22); }
+  .undo-btn.visible { display: flex; }
+
+  /* Groups the undo button and timestamp at the right end of the header */
+  .header-end {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .last-updated {
+    font-size: 12px;
+    color: var(--muted);
+    white-space: nowrap;
+  }
+
+  /* ── Board layout ── */
+  .board {
+    display: flex;
+    gap: 20px;
+    padding: 28px 32px 48px;
+    align-items: flex-start;
+  }
+
+  .column {
+    width: var(--col-w);
+    flex-shrink: 0;
+  }
+
+  .col-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 14px;
+    padding: 0 4px;
+  }
+
+  .col-title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .col-count {
+    background: var(--surface2);
+    border-radius: 20px;
+    padding: 2px 9px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  .col-accent {
+    display: block;
+    width: 28px; height: 3px;
+    border-radius: 2px;
+  }
+  .reviewing-accent   { background: var(--accent); }
+  .applied-accent     { background: var(--applied); }
+  .interviewing-accent{ background: var(--interview); }
+
+  .cards {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 120px;
+  }
+
+  .empty-state {
+    border: 1.5px dashed var(--border);
+    border-radius: var(--radius);
+    padding: 36px 20px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 13px;
+  }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    transition: border-color .18s, box-shadow .18s;
+  }
+
+  .card:hover {
+    border-color: rgba(124,106,245,.35);
+    box-shadow: 0 4px 24px rgba(0,0,0,.35);
+  }
+
+  .card.flagged-card {
+    border-color: rgba(245,158,11,.3);
+  }
+  .card.flagged-card:hover {
+    border-color: rgba(245,158,11,.55);
+  }
+
+  .card-tier {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .5px;
+    margin-bottom: 8px;
+    padding: 3px 8px;
+    border-radius: 4px;
+  }
+  .tier-perfect { background: rgba(240,192,96,.12); color: var(--perfect); }
+  .tier-good    { background: rgba(111,207,138,.12); color: var(--good); }
+  .tier-look    { background: rgba(99,170,223,.12);  color: var(--look); }
+  .tier-skip    { background: rgba(107,114,128,.1);  color: var(--skipped); }
+
+  .card-title {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.35;
+    margin-bottom: 3px;
+    color: var(--text);
+  }
+
+  .card-company {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }
+
+  .card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+
+  .meta-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    color: var(--muted);
+    background: var(--surface2);
+    border-radius: 4px;
+    padding: 3px 7px;
+  }
+
+  .salary-pill  { color: var(--good);    background: rgba(111,207,138,.1); }
+  .flagged-pill { color: var(--flagged); background: rgba(245,158,11,.1); }
+
+  .card-reason {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.5;
+    margin-bottom: 12px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .reason-expanded { -webkit-line-clamp: unset !important; }
+
+
+  /* ── Flag note textarea ── */
+  .flag-note-area {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid rgba(245,158,11,.3);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    padding: 7px 10px;
+    resize: vertical;
+    min-height: 52px;
+    margin-bottom: 8px;
+    transition: border-color .15s;
+  }
+  .flag-note-area:focus { outline: none; border-color: var(--flagged); }
+  .flag-note-area::placeholder { color: var(--muted); }
+
+  /* ── Skipped list view ── */
+  .skipped-view {
+    padding: 28px 32px 48px;
+    max-width: 900px;
+  }
+
+  .skipped-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+  }
+
+  .skipped-title {
+    font-family: 'DM Serif Display', serif;
+    font-size: 22px;
+    color: var(--text);
+  }
+  .skipped-subtitle {
+    font-size: 13px;
+    color: var(--muted);
+    margin-top: 4px;
+  }
+
+  .skipped-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .skip-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    transition: border-color .15s;
+  }
+  .skip-card:hover { border-color: rgba(255,255,255,.12); }
+  .skip-card.flagged-card { border-color: rgba(245,158,11,.3); }
+
+  .skip-card-top {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+
+  .skip-card-info { flex: 1; min-width: 0; }
+
+  .skip-card-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 2px;
+  }
+
+  .skip-card-company {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .skip-reason {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+    margin-bottom: 10px;
+    background: var(--surface2);
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+
+  .skip-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  /* ── Buttons ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--muted);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: all .15s;
+    white-space: nowrap;
+  }
+  .btn:hover { border-color: rgba(255,255,255,.18); color: var(--text); }
+
+  .btn-primary {
+    background: rgba(124,106,245,.15);
+    border-color: rgba(124,106,245,.35);
+    color: var(--accent2);
+  }
+  .btn-primary:hover { background: rgba(124,106,245,.25); }
+
+  .btn-success {
+    background: rgba(111,207,138,.1);
+    border-color: rgba(111,207,138,.3);
+    color: var(--good);
+  }
+  .btn-success:hover { background: rgba(111,207,138,.2); }
+
+  .btn-orange {
+    background: rgba(249,115,22,.1);
+    border-color: rgba(249,115,22,.3);
+    color: var(--interview);
+  }
+  .btn-orange:hover { background: rgba(249,115,22,.2); }
+
+  .btn-flag {
+    background: rgba(245,158,11,.1);
+    border-color: rgba(245,158,11,.3);
+    color: var(--flagged);
+  }
+  .btn-flag:hover { background: rgba(245,158,11,.2); }
+  .btn-flag.flagged {
+    background: rgba(245,158,11,.18);
+    border-color: rgba(245,158,11,.5);
+  }
+
+  .btn-danger {
+    background: transparent;
+    border-color: transparent;
+    color: var(--muted);
+    margin-left: auto;
+  }
+  .btn-danger:hover { color: var(--danger); border-color: rgba(224,90,90,.3); }
+
+  .btn-link {
+    background: transparent;
+    border-color: transparent;
+    color: var(--accent2);
+    padding-left: 2px;
+    padding-right: 2px;
+  }
+  .btn-link:hover { text-decoration: underline; }
+
+  .applied-badge {
+    font-size: 11px;
+    color: var(--muted);
+    font-style: italic;
+    margin-left: auto;
+    align-self: center;
+  }
+
+  /* ── Flag panel (inline) ── */
+  .flag-panel {
+    display: none;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .flag-panel.open { display: block; }
+  .flag-panel-label {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--flagged);
+    letter-spacing: .5px;
+    text-transform: uppercase;
+    margin-bottom: 6px;
+  }
+  .flag-panel-actions {
+    display: flex;
+    gap: 6px;
+  }
+  /* Board card flag panel — same visual language as skip-card flag-panel */
+  .card-flag-panel {
+    display: none;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
+  .card-flag-panel.open { display: block; }
+
+  /* ── Toast ── */
+  .toast {
+    position: fixed;
+    bottom: 28px;
+    right: 28px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 18px;
+    font-size: 13px;
+    color: var(--text);
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity .2s, transform .2s;
+    pointer-events: none;
+    z-index: 999;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .toast.show { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  .toast-undo {
+    background: transparent;
+    border: 1px solid var(--muted);
+    color: var(--text);
+    border-radius: 4px;
+    padding: 2px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .toast-undo:hover { border-color: var(--text); }
+
+  /* ── Loading ── */
+  .loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 60vh;
+    color: var(--muted);
+    font-size: 14px;
+    gap: 10px;
+  }
+  .spinner {
+    width: 20px; height: 20px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Confirm overlay ── */
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.65);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .2s;
+  }
+  .overlay.visible { opacity: 1; pointer-events: all; }
+
+  .confirm-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 28px 32px;
+    max-width: 360px;
+    width: 90%;
+    text-align: center;
+  }
+  .confirm-box h3 {
+    font-family: 'DM Serif Display', serif;
+    font-size: 20px;
+    margin-bottom: 8px;
+  }
+  .confirm-box p {
+    color: var(--muted);
+    font-size: 13px;
+    margin-bottom: 22px;
+    line-height: 1.5;
+  }
+  .confirm-actions {
+    display: flex;
+    gap: 10px;
+    justify-content: center;
+  }
+  .btn-confirm-reject {
+    background: rgba(224,90,90,.15);
+    border-color: rgba(224,90,90,.4);
+    color: var(--danger);
+    font-size: 13px;
+    padding: 8px 20px;
+  }
+  .btn-confirm-reject:hover { background: rgba(224,90,90,.25); }
+
+  svg { flex-shrink: 0; }
+
+  /* ── Health tab ─────────────────────────────────────────────── */
+  .health-view {
+    padding: 24px;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  .health-header {
+    margin-bottom: 20px;
+  }
+  .health-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .health-subtitle {
+    font-size: 13px;
+    color: var(--text-muted);
+    margin-top: 2px;
+  }
+  .health-no-data {
+    color: var(--text-muted);
+    font-size: 14px;
+    padding: 40px 0;
+    text-align: center;
+  }
+  .health-table-wrap {
+    overflow-x: auto;
+    margin-bottom: 28px;
+  }
+  .health-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+  }
+  .health-table th {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    color: var(--text-muted);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .health-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid rgba(255,255,255,.04);
+    color: var(--text);
+    white-space: nowrap;
+  }
+  .health-table tr:last-child td { border-bottom: none; }
+  .health-table tr:hover td { background: rgba(255,255,255,.02); }
+  .health-num { text-align: right; }
+  .health-zero { color: var(--text-muted); }
+  .health-section-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    margin: 24px 0 10px;
+  }
+  .health-filter-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .health-filter-pill {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 12px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+  .health-filter-pill strong { color: var(--text); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Job Search <span>Board</span></div>
+  <div class="header-stats" id="header-stats">
+    <div class="stat-chip">
+      <div class="stat-dot" style="background:var(--accent)"></div>
+      <span>Reviewing <strong id="count-reviewing">–</strong></span>
+    </div>
+    <div class="stat-chip">
+      <div class="stat-dot" style="background:var(--applied)"></div>
+      <span>Applied <strong id="count-applied">–</strong></span>
+    </div>
+    <div class="stat-chip">
+      <div class="stat-dot" style="background:var(--interview)"></div>
+      <span>Interviewing <strong id="count-interviewing">–</strong></span>
+    </div>
+    <div class="stat-chip">
+      <div class="stat-dot" style="background:var(--skipped)"></div>
+      <span>Skipped <strong id="count-skipped">–</strong></span>
+    </div>
+  </div>
+  <div class="tab-nav">
+    <button class="tab-btn active" id="tab-board" onclick="showTab('board')">
+      Board <span class="badge" id="badge-board">0</span>
+    </button>
+    <button class="tab-btn tab-skipped" id="tab-skipped" onclick="showTab('skipped')">
+      ⛔ Skipped <span class="badge" id="badge-skipped">0</span>
+    </button>
+    <button class="tab-btn" id="tab-health" onclick="showTab('health')">
+      📊 Health
+    </button>
+  </div>
+  <div class="header-end">
+    <button class="undo-btn" id="undo-btn" onclick="undoLastDelete()" title="Restore the last deleted job">
+      ↩ Undo delete
+    </button>
+    <div class="last-updated" id="last-updated"></div>
+  </div>
+</header>
+
+<div id="app">
+  <div class="loading">
+    <div class="spinner"></div>
+    Loading your job board…
+  </div>
+</div>
+
+<!-- Reject confirm overlay -->
+<div class="overlay" id="reject-overlay">
+  <div class="confirm-box">
+    <h3>Remove this job?</h3>
+    <p>This card will be hidden from your board. You can undo this using the ↩ Undo button in the header.</p>
+    <div class="confirm-actions">
+      <button class="btn" onclick="closeRejectOverlay()">Keep it</button>
+      <button class="btn btn-confirm-reject" onclick="confirmReject()">Yes, remove</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast — contains message span + optional undo button -->
+<div class="toast" id="toast">
+  <span id="toast-msg"></span>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────────
+let boardData       = null;
+let skippedData     = null;
+let pendingRejectId = null;
+let lastRejectedId  = null;  // tracks last deleted job for persistent undo
+let currentTab      = 'board';
+const COLUMNS    = ['Reviewing', 'Applied', 'Interviewing'];
+
+// ── Tab switching ──────────────────────────────────────────────────────────────
+function showTab(tab) {
+  currentTab = tab;
+  document.getElementById('tab-board').classList.toggle('active', tab === 'board');
+  document.getElementById('tab-skipped').classList.toggle('active', tab === 'skipped');
+  document.getElementById('tab-health').classList.toggle('active', tab === 'health');
+  if (tab === 'board') {
+    loadBoard();
+  } else if (tab === 'health') {
+    loadHealth();
+  } else {
+    loadSkipped();
+  }
+}
+
+// ── Board tab ──────────────────────────────────────────────────────────────────
+async function loadBoard() {
+  try {
+    const res  = await fetch('/api/board');
+    const data = await res.json();
+    boardData  = data;
+    renderBoard(data);
+    updateStats(data);
+    document.getElementById('last-updated').textContent = 'Updated ' + data.last_updated;
+  } catch (e) {
+    document.getElementById('app').innerHTML =
+      '<div class="loading" style="color:#e05a5a">Failed to load board — is dashboard.py running?</div>';
+  }
+}
+
+// ── Skipped tab ────────────────────────────────────────────────────────────────
+async function loadSkipped() {
+  document.getElementById('app').innerHTML =
+    '<div class="loading"><div class="spinner"></div>Loading skipped jobs…</div>';
+  try {
+    const res  = await fetch('/api/skipped');
+    const data = await res.json();
+    skippedData = data;
+    renderSkipped(data);
+    document.getElementById('last-updated').textContent = 'Updated ' + data.last_updated;
+    document.getElementById('badge-skipped').textContent = data.total;
+    document.getElementById('count-skipped').textContent = data.total;
+  } catch(e) {
+    document.getElementById('app').innerHTML =
+      '<div class="loading" style="color:#e05a5a">Failed to load skipped jobs.</div>';
+  }
+}
+
+function renderSkipped(data) {
+  const app = document.getElementById('app');
+  if (!data.jobs || data.jobs.length === 0) {
+    app.innerHTML = `
+      <div class="skipped-view">
+        <div class="skipped-header">
+          <div>
+            <div class="skipped-title">Skipped Jobs</div>
+            <div class="skipped-subtitle">Jobs the radar filtered out automatically</div>
+          </div>
+        </div>
+        <div class="empty-state">No skipped jobs yet — they'll appear after your next radar run.</div>
+      </div>`;
+    return;
+  }
+
+  let html = `
+    <div class="skipped-view">
+      <div class="skipped-header">
+        <div>
+          <div class="skipped-title">Skipped Jobs</div>
+          <div class="skipped-subtitle">${data.total} job${data.total !== 1 ? 's' : ''} filtered out automatically — review if anything looks wrong</div>
+        </div>
+      </div>
+      <div class="skipped-list">`;
+
+  // Fix 3: Store job data in a module-level Map keyed by cardId.
+  // This avoids embedding JSON in inline onclick attributes, which breaks when
+  // job titles or reasons contain single quotes, double quotes, or parentheses.
+  // FIX (code review): clear stale entries before each render to prevent unbounded growth.
+  _skipJobMap.clear();
+  for (const job of data.jobs) {
+    const cardId    = job.id.replace(/[^a-zA-Z0-9]/g, '-');
+    const isFlagged = job.flagged;
+    _skipJobMap.set(cardId, job);  // safe reference, no serialisation in HTML
+
+    html += `
+      <div class="skip-card ${isFlagged ? 'flagged-card' : ''}" id="skipcard-${cardId}" data-job-id="${escHtml(job.id)}">
+        <div class="skip-card-top">
+          <div class="skip-card-info">
+            <div class="skip-card-title">${escHtml(job.title)}</div>
+            <div class="skip-card-company">${escHtml(job.company)}${job.location ? ' · ' + escHtml(job.location) : ''}${job.date_found ? ' · ' + job.date_found : ''}</div>
+          </div>
+          ${isFlagged ? '<span class="meta-pill flagged-pill">🚩 Flagged for review</span>' : ''}
+        </div>
+        <div class="skip-reason">${escHtml(job.reason)}</div>
+        <div class="skip-actions">
+          ${job.url
+            // Fix 2: URL stored in data-url attribute, never injected into onclick string.
+            // openLinkSafe() reads it back via dataset — safe against quotes in URLs.
+            ? `<button class="btn btn-link" data-url="${escHtml(job.url)}" onclick="openLinkSafe(this)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+                View job</button>`
+            : ''}
+          <button class="btn btn-success" onclick="restoreJob(this, '${cardId}')">
+            ✓ Add to Reviewing
+          </button>
+          <button class="btn ${isFlagged ? 'btn-flag flagged' : 'btn-flag'}"
+            onclick="toggleFlagPanel('${cardId}')">
+            🚩 ${isFlagged ? 'Flagged' : 'Flag for Review'}
+          </button>
+          <button class="btn btn-danger" onclick="dismissSkip(this, '${cardId}')" title="Hide permanently">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>
+          </button>
+        </div>
+        <div class="flag-panel ${isFlagged ? 'open' : ''}" id="flagpanel-${cardId}">
+          <div class="flag-panel-label">🚩 Why should this be included?</div>
+          <textarea class="flag-note-area" id="flagnote-${cardId}"
+            placeholder="Add a note for Claude — e.g. 'This is post-origination servicing, not underwriting'"></textarea>
+          <div class="flag-panel-actions">
+            <button class="btn btn-flag" onclick="submitFlag(this, '${cardId}')">
+              Submit Flag
+            </button>
+            <button class="btn" onclick="toggleFlagPanel('${cardId}')">Cancel</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  html += '</div></div>';
+  app.innerHTML = html;
+}
+
+// Module-level map: cardId -> job object. Populated by renderSkipped().
+// Avoids embedding serialised JSON in onclick attributes (Fix 3).
+const _skipJobMap = new Map();
+
+// ── Health tab ─────────────────────────────────────────────────────────────────
+async function loadHealth() {
+  const app = document.getElementById('app');
+  app.innerHTML = '<div class="loading"><div class="spinner"></div>Loading run history…</div>';
+  try {
+    const res  = await fetch('/api/health');
+    const data = await res.json();
+    renderHealth(data);
+  } catch (e) {
+    app.innerHTML = '<div class="loading" style="color:#e05a5a">Failed to load health data.</div>';
+  }
+}
+
+function renderHealth(data) {
+  const app = document.getElementById('app');
+  if (!data.runs || data.runs.length === 0) {
+    app.innerHTML = `
+      <div class="health-view">
+        <div class="health-header">
+          <div class="health-title">Radar Health</div>
+          <div class="health-subtitle">Run history and source stats</div>
+        </div>
+        <div class="health-no-data">No runs recorded yet — the DB is created after the first radar run.</div>
+      </div>`;
+    return;
+  }
+
+  const sources = data.sources || [];
+
+  // Build source columns header
+  const sourceHeaders = sources.map(s =>
+    `<th class="health-num">${escHtml(s)}</th>`
+  ).join('');
+
+  // Build run rows
+  const rows = data.runs.map(run => {
+    const date    = run.started_at ? run.started_at.slice(0, 16).replace('T', ' ') : '—';
+    const dur     = (run.started_at && run.finished_at)
+      ? Math.round((new Date(run.finished_at) - new Date(run.started_at)) / 1000) + 's'
+      : '—';
+
+    // Map source name -> raw count for this run
+    const srcMap = {};
+    (run.sources || []).forEach(s => { srcMap[s.source] = s.raw_count; });
+
+    const sourceCells = sources.map(s => {
+      const n = srcMap[s] || 0;
+      return `<td class="health-num ${n === 0 ? 'health-zero' : ''}">${n}</td>`;
+    }).join('');
+
+    // Filter summary for tooltip
+    const filterSummary = (run.filters || []).map(f => `${f.reason}: ${f.count}`).join(' | ') || 'none';
+
+    return `<tr title="Filtered: ${escHtml(filterSummary)}">
+      <td>${escHtml(date)}</td>
+      <td class="health-num">${run.total_raw || 0}</td>
+      <td class="health-num">${run.total_new || 0}</td>
+      <td class="health-num">${run.total_rated || 0}</td>
+      <td>${escHtml(dur)}</td>
+      ${sourceCells}
+    </tr>`;
+  }).join('');
+
+  // Aggregate filter stats across all runs for summary pills
+  const filterTotals = {};
+  data.runs.forEach(run => {
+    (run.filters || []).forEach(f => {
+      filterTotals[f.reason] = (filterTotals[f.reason] || 0) + f.count;
+    });
+  });
+  const filterPills = Object.entries(filterTotals)
+    .sort((a, b) => b[1] - a[1])
+    .map(([r, c]) => `<div class="health-filter-pill"><strong>${c}</strong> ${escHtml(r)}</div>`)
+    .join('');
+
+  app.innerHTML = `
+    <div class="health-view">
+      <div class="health-header">
+        <div class="health-title">Radar Health</div>
+        <div class="health-subtitle">Last ${data.runs.length} runs · hover a row to see filter breakdown</div>
+      </div>
+
+      <div class="health-table-wrap">
+        <table class="health-table">
+          <thead>
+            <tr>
+              <th>Run</th>
+              <th class="health-num">Raw</th>
+              <th class="health-num">New</th>
+              <th class="health-num">Rated</th>
+              <th>Duration</th>
+              ${sourceHeaders}
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+
+      <div class="health-section-title">Filter totals (all runs)</div>
+      <div class="health-filter-grid">${filterPills || '<span style="color:var(--text-muted);font-size:13px">No filter data yet</span>'}</div>
+    </div>`;
+}
+
+// Fix 2: Safe URL opener that reads from data-url attribute, never from inline string.
+function openLinkSafe(btn) {
+  const url = btn.dataset.url;
+  if (url) window.open(url, '_blank', 'noopener');
+}
+
+// Toggle the flag note panel on skipped tab cards.
+// Separate from toggleBoardFlagPanel to keep skipped and board logic independent.
+function toggleFlagPanel(cardId) {
+  const panel = document.getElementById('flagpanel-' + cardId);
+  if (panel) panel.classList.toggle('open');
+}
+
+// ── Skipped actions ────────────────────────────────────────────────────────────
+async function restoreJob(btn, cardId) {
+  const card = document.getElementById('skipcard-' + cardId);
+  const id   = card ? card.dataset.jobId : '';
+  if (!id) { console.error('restoreJob: no job id for cardId', cardId); return; }
+  try {
+    const resp = await fetch('/api/restore', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
+    // FIX (code review): only remove card from DOM after server confirms success.
+    // Previously the card was removed regardless of resp.ok, so a 500 would leave
+    // the job disappearing from Skipped but never appearing in Reviewing.
+    if (!resp.ok) {
+      showToast('Error restoring job — try again');
+      return;
+    }
+  } catch (e) {
+    console.error('restoreJob network error:', e);
+    showToast('Network error — is the dashboard running?');
+    return;
+  }
+  card?.remove();
+  _skipJobMap.delete(cardId);
+  updateSkippedBadge(-1);
+  showToast('Added to Reviewing — switch to Board tab to see it');
+}
+
+async function dismissSkip(btn, cardId) {
+  const card = document.getElementById('skipcard-' + cardId);
+  const id   = card ? card.dataset.jobId : '';
+  if (!id) { console.error('dismissSkip: no job id for cardId', cardId); return; }
+  try {
+    const resp = await fetch('/api/skip_dismiss', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id}),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      console.error('dismissSkip failed:', resp.status, err);
+      showToast('Error hiding job — check console');
+      return;
+    }
+  } catch (e) {
+    console.error('dismissSkip network error:', e);
+    showToast('Network error — is the dashboard running?');
+    return;
+  }
+  document.getElementById('skipcard-' + cardId)?.remove();
+  _skipJobMap.delete(cardId);
+  updateSkippedBadge(-1);
+  showToast('Hidden permanently');
+  // FIX: if that was the last card, show the empty state so the view
+  // doesn't go blank. Check the skipped-list container for remaining cards.
+  const list = document.querySelector('.skipped-list');
+  if (list && list.querySelectorAll('.skip-card').length === 0) {
+    document.getElementById('app').innerHTML = `
+      <div class="skipped-view">
+        <div class="skipped-header">
+          <div>
+            <div class="skipped-title">Skipped Jobs</div>
+            <div class="skipped-subtitle">Jobs the radar filtered out automatically</div>
+          </div>
+        </div>
+        <div class="empty-state">No skipped jobs yet — they'll appear after your next radar run.</div>
+      </div>`;
+  }
+}
+
+// Fix 3: Job data is read from _skipJobMap — no JSON serialisation in HTML attributes.
+async function submitFlag(btn, cardId) {
+  const card = document.getElementById('skipcard-' + cardId);
+  const id   = card ? card.dataset.jobId : '';
+  if (!id) { console.error('submitFlag: no job id for cardId', cardId); return; }
+  const job    = _skipJobMap.get(cardId) || {};
+  const noteEl = document.getElementById('flagnote-' + cardId);
+  const note   = noteEl ? noteEl.value.trim() : '';
+  await fetch('/api/flag', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, note, job}),
+  });
+  // Reuse the card reference already declared above — do not redeclare with const
+  if (card) {
+    card.classList.add('flagged-card');
+    const panel = document.getElementById('flagpanel-' + cardId);
+    if (panel) panel.classList.remove('open');
+  }
+  showToast('🚩 Flagged for review — saved to flagged_for_review.json');
+}
+
+// Fix 9: Adjust skipped badge count without a full reload.
+function updateSkippedBadge(delta) {
+  const badge = document.getElementById('badge-skipped');
+  const stat  = document.getElementById('count-skipped');
+  const curr  = parseInt(badge?.textContent || '0', 10);
+  const next  = Math.max(0, curr + delta);
+  if (badge) badge.textContent = next;
+  if (stat)  stat.textContent  = next;
+}
+
+// ── Board render ───────────────────────────────────────────────────────────────
+function renderBoard(data) {
+  const board = document.getElementById('app');
+  // FIX (code review): clear stale entries from previous render so dismissed/
+  // rejected jobs don't linger in the map and cause memory growth over time.
+  _boardJobMap.clear();
+  let html = '<div class="board">';
+
+  const colMeta = {
+    'Reviewing':    { accent: 'reviewing-accent',     label: 'Reviewing' },
+    'Applied':      { accent: 'applied-accent',       label: 'Applied' },
+    'Interviewing': { accent: 'interviewing-accent',  label: 'Interviewing' },
+  };
+
+  for (const col of COLUMNS) {
+    const cards = data.columns[col] || [];
+    const meta  = colMeta[col];
+
+    html += `
+      <div class="column" id="col-${col.toLowerCase()}">
+        <div class="col-header">
+          <div class="col-title">
+            <span class="col-accent ${meta.accent}"></span>
+            ${meta.label}
+          </div>
+          <span class="col-count">${cards.length}</span>
+        </div>
+        <div class="cards" id="cards-${col}">`;
+
+    if (cards.length === 0) {
+      html += `<div class="empty-state">No jobs here yet</div>`;
+    } else {
+      for (const job of cards) {
+        html += renderCard(job, col);
+      }
+    }
+
+    html += `</div></div>`;
+  }
+
+  html += '</div>';
+  board.innerHTML = html;
+
+}
+
+function tierClass(tier) {
+  if (tier === 'Perfect Fit') return 'tier-perfect';
+  if (tier === 'Good Fit')    return 'tier-good';
+  return 'tier-look';
+}
+
+function tierEmoji(tier) {
+  if (tier === 'Perfect Fit') return '⭐';
+  if (tier === 'Good Fit')    return '🟢';
+  return '🟡';
+}
+
+function renderCard(job, col) {
+  const tc   = tierClass(job.tier);
+  const prev = COLUMNS[COLUMNS.indexOf(col) - 1];
+  const next = COLUMNS[COLUMNS.indexOf(col) + 1];
+
+  const salHtml = job.salary_display
+    ? `<span class="meta-pill salary-pill">💰 ${job.salary_display}</span>`
+    : '';
+  const srcHtml  = job.source    ? `<span class="meta-pill">${job.source}</span>`     : '';
+  const dateHtml = job.date_found ? `<span class="meta-pill">${job.date_found}</span>` : '';
+
+  const reasonId  = 'reason-' + job.id.replace(/[^a-zA-Z0-9]/g, '-');
+
+  // Store job in map so flag actions can read data safely without inline JSON
+  const cardId = job.id.replace(/[^a-zA-Z0-9]/g, '-');
+  _boardJobMap.set(cardId, job);
+
+  const isFlagged = job.flagged || false;
+
+  const prevBtn = prev
+    ? `<button class="btn" onclick="moveCard('${cardId}','${prev}')" title="Move to ${prev}">← ${prev}</button>`
+    : '';
+
+  const nextBtn = next
+    ? `<button class="btn btn-${next === 'Applied' ? 'success' : 'orange'}"
+         onclick="moveCard('${cardId}','${next}')">
+         ${next === 'Applied' ? '✓ Applied' : '📞 Interviewing'}</button>`
+    : '';
+
+  const appliedBadge = col === 'Applied' && job.applied_date
+    ? `<span class="applied-badge">Applied ${job.applied_date}</span>`
+    : '';
+
+  return `
+    <div class="card" id="card-${cardId}" data-job-id="${escHtml(job.id)}">
+      <div class="card-tier ${tc}">${tierEmoji(job.tier)} ${job.tier}</div>
+      <div class="card-title">${escHtml(job.title)}</div>
+      <div class="card-company">${escHtml(job.company)}${job.location ? ' · ' + escHtml(job.location) : ''}</div>
+      <div class="card-meta">${salHtml}${srcHtml}${dateHtml}${isFlagged ? '<span class="meta-pill" style="color:var(--flagged)">🚩 Flagged</span>' : ''}</div>
+      <div class="card-reason" id="${reasonId}" onclick="toggleReason('${reasonId}')">
+        ${escHtml(job.reason)}
+      </div>
+      <div class="card-actions">
+        ${job.url
+          ? `<button class="btn btn-link" data-url="${escHtml(job.url)}" onclick="openLinkSafe(this)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+              View job</button>`
+          : ''}
+
+        <button class="btn ${isFlagged ? 'btn-flag flagged' : 'btn-flag'}"
+          onclick="toggleBoardFlagPanel('${cardId}')" title="Flag this job — tell us why it shouldn't have appeared">
+          🚩 ${isFlagged ? 'Flagged' : 'Flag'}
+        </button>
+        ${prevBtn}
+        ${nextBtn}
+        ${appliedBadge}
+        <button class="btn btn-danger" onclick="askReject('${cardId}')" title="Remove from board">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>
+        </button>
+      </div>
+      <div class="card-flag-panel ${isFlagged ? 'open' : ''}" id="boardflagpanel-${cardId}">
+        <div class="flag-panel-label">🚩 Why shouldn't this have appeared?</div>
+        <textarea class="flag-note-area" id="boardflagnote-${cardId}"
+          placeholder="e.g. 'This is a staffing agency' or 'Title looks like PM but it's a sales role'"></textarea>
+        <div class="flag-panel-actions">
+          <button class="btn btn-flag" onclick="submitBoardFlag('${cardId}')">Submit Flag</button>
+          <button class="btn" onclick="toggleBoardFlagPanel('${cardId}')">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// Module-level map: cardId -> job object for board cards.
+// Populated by renderCard() — avoids embedding JSON in onclick attributes.
+// FIX (code review): cleared at the start of each renderBoard() call so stale
+// entries from rejected/dismissed jobs don't accumulate across reloads.
+const _boardJobMap = new Map();
+
+function toggleBoardFlagPanel(cardId) {
+  const panel = document.getElementById('boardflagpanel-' + cardId);
+  if (panel) panel.classList.toggle('open');
+}
+
+async function submitBoardFlag(cardId) {
+  const card = document.getElementById('card-' + cardId);
+  const id   = card ? card.dataset.jobId : '';
+  if (!id) { console.error('submitBoardFlag: no job id for cardId', cardId); return; }
+  const job    = _boardJobMap.get(cardId) || {};
+  const noteEl = document.getElementById('boardflagnote-' + cardId);
+  const note   = noteEl ? noteEl.value.trim() : '';
+  await fetch('/api/flag', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({id, note, job}),
+  });
+  // Mark card as flagged visually without reloading the full board
+  if (card) {
+    const panel = document.getElementById('boardflagpanel-' + cardId);
+    if (panel) panel.classList.remove('open');
+    const flagBtn = card.querySelector('.btn-flag');
+    if (flagBtn) { flagBtn.classList.add('flagged'); flagBtn.textContent = '🚩 Flagged'; }
+    // Add flagged pill to meta row if not already there
+    const meta = card.querySelector('.card-meta');
+    if (meta && !meta.querySelector('.flag-pill')) {
+      const pill = document.createElement('span');
+      pill.className = 'meta-pill flag-pill';
+      pill.style.color = 'var(--flagged)';
+      pill.textContent = '🚩 Flagged';
+      meta.appendChild(pill);
+    }
+  }
+  showToast('🚩 Flagged for review — saved to flagged_for_review.json');
+}
+
+// ── Board actions ──────────────────────────────────────────────────────────────
+async function undoLastDelete() {
+  if (!lastRejectedId) return;
+  try {
+    const resp = await fetch('/api/unreject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: lastRejectedId}),
+    });
+    if (!resp.ok) {
+      showToast('Error restoring job — try again');
+      return;  // keep undo button visible so user can retry
+    }
+  } catch (e) {
+    console.error('undoLastDelete error:', e);
+    showToast('Network error — is the dashboard running?');
+    return;  // keep undo button visible so user can retry
+  }
+  lastRejectedId = null;
+  document.getElementById('undo-btn').classList.remove('visible');
+  loadBoard();
+  showToast('Job restored to board');
+}
+async function moveCard(cardId, column) {
+  // cardId is the safe DOM-sanitised key — look up the real job id from the map
+  const job = _boardJobMap.get(cardId);
+  const id  = job ? job.id : cardId;
+  try {
+    const resp = await fetch('/api/move', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id, column}),
+    });
+    if (!resp.ok) { showToast('Error moving card — try again'); return; }
+    showToast(`Moved to ${column}`);
+    loadBoard();
+  } catch (e) {
+    console.error('moveCard error:', e);
+    showToast('Network error — is the dashboard running?');
+  }
+}
+
+function askReject(cardId) {
+  // cardId is the safe DOM-sanitised key — look up the real job id from the map
+  const job = _boardJobMap.get(cardId);
+  pendingRejectId = job ? job.id : cardId;
+  document.getElementById('reject-overlay').classList.add('visible');
+}
+
+function closeRejectOverlay() {
+  pendingRejectId = null;
+  document.getElementById('reject-overlay').classList.remove('visible');
+}
+
+async function confirmReject() {
+  if (!pendingRejectId) return;
+  const rejectedId = pendingRejectId;
+  try {
+    const resp = await fetch('/api/reject', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: rejectedId}),
+    });
+    if (!resp.ok) {
+      closeRejectOverlay();
+      showToast('Error removing job — try again');
+      return;
+    }
+  } catch (e) {
+    console.error('confirmReject error:', e);
+    closeRejectOverlay();
+    showToast('Network error — is the dashboard running?');
+    return;
+  }
+  closeRejectOverlay();
+  // Track the deleted job and show the persistent undo button in the header
+  lastRejectedId = rejectedId;
+  document.getElementById('undo-btn').classList.add('visible');
+  loadBoard();
+  showToast('Job removed from board');
+}
+
+function toggleReason(reasonId) {
+  document.getElementById(reasonId)?.classList.toggle('reason-expanded');
+}
+
+// ── Stats ──────────────────────────────────────────────────────────────────────
+function updateStats(data) {
+  const r = (data.columns['Reviewing']    || []).length;
+  const a = (data.columns['Applied']      || []).length;
+  const i = (data.columns['Interviewing'] || []).length;
+  document.getElementById('count-reviewing').textContent    = r;
+  document.getElementById('count-applied').textContent      = a;
+  document.getElementById('count-interviewing').textContent = i;
+  document.getElementById('badge-board').textContent        = r + a + i;
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────────
+function escHtml(str) {
+  if (!str) return '';
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+            .replace(/"/g,'&quot;').replace(/'/g,'&#039;');
+}
+
+let toastTimer = null;
+function showToast(msg) {
+  const t    = document.getElementById('toast');
+  const msgEl = document.getElementById('toast-msg');
+  msgEl.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2800);
+}
+
+document.getElementById('reject-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeRejectOverlay();
+});
+
+// ── Boot ───────────────────────────────────────────────────────────────────────
+// Load skipped count for badge on startup, then show board
+(async () => {
+  try {
+    const res  = await fetch('/api/skipped');
+    const data = await res.json();
+    // FIX (code review): guard data.total in case API returns unexpected shape
+    document.getElementById('badge-skipped').textContent  = data.total || 0;
+    document.getElementById('count-skipped').textContent  = data.total || 0;
+  } catch(_) {}
+})();
+loadBoard();
+</script>
+</body>
+</html>"""
+
+
+def _prune_board_state():
+    """Remove stale skip_dismissed entries from board_state.json on startup.
+
+    BUG FIX: the original implementation had two prunable set definitions —
+    the second silently overwrote the first. The second condition pruned any
+    entry with rejected=True and no column set, which matched EVERY rejected
+    board card (api_reject only sets rejected=True, never a column). This
+    caused all rejected jobs to disappear from board_state.json on every
+    restart, making them reappear on the board.
+
+    Safe pruning rules:
+    - NEVER prune rejected=True entries. These are explicit user actions on
+      board cards. They must survive restarts or the job reappears.
+    - ONLY prune skip_dismissed=True entries (skipped-tab dismissals). These
+      are low-stakes and accumulate fast (one per skipped job dismissed).
+    - Always preserve flagged, applied_date, column, and restored entries.
+    """
+    state = load_board_state()
+    before = len(state)
+    prunable = {
+        jid for jid, s in state.items()
+        if s.get("skip_dismissed")          # only skipped-tab dismissals
+        and not s.get("rejected")           # never touch board rejections
+        and not s.get("flagged")            # keep flagged entries
+        and not s.get("applied_date")       # keep anything with applied date
+        and not s.get("column")             # keep anything moved to a column
+        and not s.get("restored")           # keep restored jobs
+    }
+    # Cap at 500 per run to avoid slow startup after a long gap
+    for jid in list(prunable)[:500]:
+        del state[jid]
+    pruned = before - len(state)
+    if pruned:
+        try:
+            save_board_state(state)
+            print(f"  Board state pruned: removed {pruned} stale skip-dismissed entries")
+        except OSError:
+            pass  # non-critical — pruning is best-effort
+
+
+if __name__ == "__main__":
+    os.makedirs(JOBS_DIR, exist_ok=True)
+    _prune_board_state()
+    print("\n  Job Search Dashboard")
+    print("  ─────────────────────────────────────────")
+    print("  Open http://localhost:5000 in your browser")
+    print("  Press Ctrl+C to stop\n")
+    app.run(debug=False, port=5000)
