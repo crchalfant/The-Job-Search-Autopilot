@@ -166,7 +166,7 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from config import (
-        MIN_SALARY, VACATION_START, VACATION_END, PROFILE, RALEIGH_TERMS, QUOTES,
+        MIN_SALARY, VACATION_START, VACATION_END, PROFILE, LOCAL_METRO_TERMS, QUOTES,
         ADZUNA_QUERIES, BRAVE_QUERIES, TAVILY_QUERIES,
         LI_REMOTE_QUERIES, LI_RALEIGH_QUERIES,
         HIMALAYAS_QUERIES, REMOTIVE_QUERIES, USAJOBS_QUERIES, JOBICY_QUERIES,
@@ -1627,8 +1627,8 @@ def search_linkedin():
         time.sleep(1.5)
         results = _li_fetch(q, remote=False)
         # Filter to only local metro results
-        # Use RALEIGH_TERMS from config.py so local filter stays in sync with your metro
-        filtered = [j for j in results if any(t in j.get("location", "").lower() for t in RALEIGH_TERMS)]
+        # Use LOCAL_METRO_TERMS from config.py so local filter stays in sync with your metro
+        filtered = [j for j in results if any(t in j.get("location", "").lower() for t in LOCAL_METRO_TERMS)]
         jobs.extend(filtered)
         print(f"  LinkedIn Raleigh ({q}): {len(filtered)} results")
 
@@ -2869,19 +2869,19 @@ def clear_buffer():
 
 # ── LOCAL JOB DETECTOR ───────────────────────────────────────────────────────
 
-# RALEIGH_TERMS imported from config.py — set your own metro area cities there
+# LOCAL_METRO_TERMS imported from config.py — replace with your own city and suburbs
 
 def is_local_metro(job):
     """Returns True if the job appears to be on-site/hybrid in the user's local metro area.
-    Uses RALEIGH_TERMS from config.py — update that list with your own city and suburbs.
+    Uses LOCAL_METRO_TERMS from config.py — update that list with your own city and suburbs.
     """
     loc = job.get("location", "").lower()
     desc = job.get("description", "").lower()
     combined = loc + " " + desc[:500]  # check location + top of description
-    has_raleigh = any(t in combined for t in RALEIGH_TERMS)
+    has_local   = any(t in combined for t in LOCAL_METRO_TERMS)
     # Don't flag pure remote jobs - a job can mention RTP in a description and still be remote
     is_remote = "remote" in loc or (not loc and "remote" in desc[:200])
-    return has_raleigh and not is_remote
+    return has_local and not is_remote
 
 # ── EMAIL ─────────────────────────────────────────────────────────────────────
 
