@@ -58,10 +58,10 @@ CHANGELOG (reverse chronological)
   2026-03-18 - Session 5: Bug fixes from live testing
     - salary_ok() bug fix: was using salary_min to check against MIN_SALARY floor.
       For a range like $140K-$180K this set sal=140K and dropped the job even though
-      MIN_SALARY falls within the range. Fixed to use salary_max when both fields are set,
-      so a job only gets dropped if the ENTIRE range is confirmed below MIN_SALARY.
+      $150K falls within the range. Fixed to use salary_max when both fields are set,
+      so a job only gets dropped if the ENTIRE range is confirmed below $150K.
     - Also clarified Claude prompt rule: skip only when the TOP of the range is below
-      MIN_SALARY, not when the bottom is.
+      $150K, not when the bottom is.
     - FutureWarning fix: [---to] in _SALARY_CONTEXT_RE (em-dash cleanup artifact)
       turned [--to] into [---to] which Python 3.12 treats as ambiguous set difference.
       Fixed to [-to].
@@ -125,6 +125,7 @@ CHANGELOG (reverse chronological)
       employerdirecthealthcare, anchorage, entersekt, versapay, aledade,
       redventures, atbayjobs, federato, sureify, ethoslife, kapitus, BestEgg,
       spreedly, truv, sparkadvisors, deepintent, modernhealth, oportun, etc.
+    - forbrightbank: confirmed correct Lever slug (forbright-bank was 404)
     - ATS_NAME_OVERRIDES: added display name corrections for all new slugs
     - 133-slug clean sweep: all confirmed live before each deployment
 
@@ -135,8 +136,8 @@ CHANGELOG (reverse chronological)
       salary string parser false positives, WWR company extraction
     - Added: RemoteOK as 12th source, company signal layer (Wikipedia), parallel
       Claude rating (ThreadPoolExecutor), ATS description fetching improvements
-    - rtp removed from Raleigh terms (was matching "Real-Time Payments" and
-      surfacing Munich jobs in the Raleigh section)
+    - rtp removed from local metro terms (was matching "Real-Time Payments" and
+      surfacing unrelated jobs in the local section)
 """
 
 import os
@@ -166,9 +167,9 @@ load_dotenv()
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from config import (
-        MIN_SALARY, VACATION_START, VACATION_END, PROFILE, RALEIGH_TERMS, QUOTES,
+        MIN_SALARY, VACATION_START, VACATION_END, PROFILE, LOCAL_METRO_TERMS, QUOTES,
         ADZUNA_QUERIES, BRAVE_QUERIES, TAVILY_QUERIES,
-        LI_REMOTE_QUERIES, LI_RALEIGH_QUERIES,
+        LI_REMOTE_QUERIES, LI_LOCAL_QUERIES,
         HIMALAYAS_QUERIES, REMOTIVE_QUERIES, USAJOBS_QUERIES, JOBICY_QUERIES,
     )
 except ModuleNotFoundError:
@@ -363,6 +364,7 @@ ATS_NAME_OVERRIDES = {
     "Jerry.ai":        "Jerry",
     "varomoney":       "Varo Bank",
     "monzo":           "Monzo",
+    "forbrightbank":   "Forbright Bank",
     "tilthq":          "Tilt",
     "galileofinancialtechnologies": "Galileo Financial Technologies",
     "employerdirecthealthcare": "Employer Direct Healthcare",
@@ -816,7 +818,7 @@ _NON_US_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Regex to detect non-Raleigh / non-US cities embedded in job URLs
+# Regex to detect out-of-metro / non-US cities embedded in job URLs
 
 # ── LOCATION FILTERS — CUSTOMISE FOR YOUR CITY ───────────────────────────────
 #
@@ -955,13 +957,13 @@ def is_non_us_location(job):
             return True
     return False
 
-def is_onsite_non_raleigh(job):
+def is_onsite_outside_local_metro(job):
     """
-    Returns True if the job requires on-site attendance at a non-Raleigh location.
+    Returns True if the job requires on-site attendance outside the user's local metro.
 
     Two detection paths:
       1. URL-based: URL contains a city slug (LinkedIn, Brave, Tavily job links)
-      2. Location-field: location field contains a non-Raleigh city (ATS jobs;
+      2. Location-field: location field contains a city outside the local metro (ATS jobs;
          Greenhouse/Lever/Ashby URLs have no city slugs, so URL check alone misses them)
 
     See CHANGELOG for details on the location-field check added in Session 4.
@@ -1041,12 +1043,12 @@ def is_category_page(job):
 
 def _parse_salary_string(s):
     """
-    Converts salary strings like '$120K', '$120,000', '$120k-$160k' to a number.
+    Converts salary strings like '$120K', '$120,000', '$120k-$150k' to a number.
     Returns the UPPER bound of a range (or single value if no range), so salary_ok
     can correctly check whether the range reaches MIN_SALARY.
 
     BUG FIX: original returned the first (lower) number. For "$123,000 - $163,000"
-    this gave 123,000, dropping the job even though the max $163K clears MIN_SALARY.
+    this gave 123,000, dropping the job even though the max $163K clears $150K.
     Now returns the max value found, matching the salary_max logic in salary_ok.
 
     Returns 0 (no salary info - let it through) for:
@@ -1086,10 +1088,10 @@ def salary_ok(job):
 
     BUG FIX: original code used salary_min as the check value. For a range like
     $140K-$180K this gave sal=140K and incorrectly dropped the job even though
-    MIN_SALARY falls within the range. Correct logic:
+    $150K (MIN_SALARY) falls within the range. Correct logic:
       - If salary_max is set: check salary_max >= MIN_SALARY (range reaches the floor)
       - If only salary_min (no max): pass through - we cannot confirm the ceiling
-        is below MIN_SALARY, and a single low min may just be the base of an unlisted range
+        is below $150K, and a single low min may just be the base of an unlisted range
       - String salary (e.g. "$140K" with no range): this is likely a specific figure,
         so check it directly against MIN_SALARY
       - No salary data: always pass
@@ -1402,9 +1404,8 @@ def search_brave():
 def search_tavily():
     """Search Tavily for job postings across all TAVILY_QUERIES.
 
-    FIX (code review): was sequential — 36 queries × 1-2s = ~60s blocking.
-    Now parallelised with 10 workers. Tavily has no strict per-second rate
-    limit on paid plans so higher concurrency is safe.
+    Hardened against HTTP errors, invalid JSON, and schema drift.
+    Concurrency reduced to 5 workers to lower the chance of rate-limit bursts.
     """
     queries = TAVILY_QUERIES  # defined in config.py
 
@@ -1412,16 +1413,40 @@ def search_tavily():
         try:
             r = requests.post(
                 "https://api.tavily.com/search",
-                json={"api_key": TAVILY_API_KEY, "query": q, "max_results": 5},
-                timeout=10,
+                json={
+                    "api_key": TAVILY_API_KEY,
+                    "query": q,
+                    "max_results": 5,
+                    "topic": "general",
+                    "search_depth": "basic",
+                },
+                timeout=15,
             )
+            r.raise_for_status()
+
+            payload = r.json()
+            if not isinstance(payload, dict):
+                print(f"Tavily error ({q[:40]}): unexpected payload type")
+                return []
+
+            items = payload.get("results", [])
+            if not isinstance(items, list):
+                print(f"Tavily error ({q[:40]}): invalid results shape")
+                return []
+
             results = []
-            for item in r.json().get("results", []):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
                 results.append({
                     "title":       item.get("title", ""),
                     "company":     "",
                     "location":    "",
-                    "description": re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html.unescape(item.get("content", "") or ""))).strip()[:5000],
+                    "description": re.sub(
+                        r"\s+",
+                        " ",
+                        re.sub(r"<[^>]+>", " ", html.unescape(item.get("content", "") or "")),
+                    ).strip()[:5000],
                     "salary_min":  0,
                     "salary_max":  0,
                     "url":         item.get("url", ""),
@@ -1429,12 +1454,30 @@ def search_tavily():
                     "source":      "Tavily",
                 })
             return results
+
+        except requests.HTTPError as e:
+            body = ""
+            try:
+                body = (r.text or "")[:500]
+            except Exception:
+                pass
+            print(f"Tavily HTTP error ({q[:40]}): {e} | body={body}")
+            return []
+
+        except ValueError as e:
+            print(f"Tavily JSON error ({q[:40]}): {e}")
+            return []
+
+        except requests.RequestException as e:
+            print(f"Tavily request error ({q[:40]}): {e}")
+            return []
+
         except Exception as e:
-            print(f"Tavily error ({q[:40]}): {e}")
+            print(f"Tavily unexpected error ({q[:40]}): {e}")
             return []
 
     jobs = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         for result_list in executor.map(_fetch_one, queries):
             jobs.extend(result_list)
     return jobs
@@ -2620,7 +2663,7 @@ def search_linkedin():
 
     remote_queries = LI_REMOTE_QUERIES  # defined in config.py
 
-    raleigh_queries = LI_RALEIGH_QUERIES  # defined in config.py
+    local_queries = LI_LOCAL_QUERIES  # defined in config.py
 
     jobs = []
 
@@ -2631,16 +2674,16 @@ def search_linkedin():
         jobs.extend(results)
         print(f"  LinkedIn remote ({q}): {len(results)} results")
 
-    # Raleigh local searches - use a North Carolina geoId
-    # geoId 103644278 = United States, but LinkedIn will filter by keyword location
-    for q in raleigh_queries:
+    # Local metro searches
+    # LinkedIn keyword location is filtered after fetch using LOCAL_METRO_TERMS
+    for q in local_queries:
         time.sleep(1.5)
         results = _li_fetch(q, remote=False)
-        # Filter to only NC results - "rtp" excluded (ambiguous with Real-Time Payments)
-        # FIX: use RALEIGH_TERMS from config.py so local filter stays in sync
-        filtered = [j for j in results if any(t in j.get("location", "").lower() for t in RALEIGH_TERMS)]
+        # Filter to only results inside the user-defined local metro terms
+        # Keep local filtering in sync with config.py
+        filtered = [j for j in results if any(t in j.get("location", "").lower() for t in LOCAL_METRO_TERMS)]
         jobs.extend(filtered)
-        print(f"  LinkedIn Raleigh ({q}): {len(filtered)} results")
+        print(f"  LinkedIn local ({q}): {len(filtered)} results")
 
     return jobs
 
@@ -2874,7 +2917,8 @@ def search_ats_companies():
         "tilthq",  # Tilt credit-building app; Ashby confirmed
         "greenlight", "gohenry",
         "daylight",
-            "chime",
+        "forbrightbank",  # Lever confirmed slug (forbright-bank and forbright both 404)
+        "chime",
         # ── Payments ─────────────────────────────────────────────────────────
         "stripe", "marqeta", "lithic", "highnote",
         "dwolla",
@@ -2909,7 +2953,7 @@ def search_ats_companies():
         "middesk", "parafin",
         "capchase", "clearco",
         "drivewealth",         "leadbank",
-        "pathward",  # banking-as-a-service; Greenhouse slug; roles typically below market rate
+        "pathward",  # banking-as-a-service; Greenhouse slug; all posted roles below $150K
         "checkr",  # background checks; Greenhouse slug; all PM roles Denver/SF on-site
         "lendingtree",  # fintech marketplace; Greenhouse slug; all roles Seattle/Denver on-site
         "whoop",  # wearables; Lever slug; all PM roles Boston on-site
@@ -2965,7 +3009,7 @@ def search_ats_companies():
         # ── Retail / consumer tech with financial products ────────────────────
         "stitchfix",  # Greenhouse confirmed; Sr PM Financial Systems role seen
         # ── Major US credit unions ────────────────────────────────────────────
-        # ── NC / Raleigh-area banks and institutions ──────────────────────────
+        # ── NC / local metro banks and institutions ──────────────────────────
         # ── Additional confirmed slugs (added 2026-04-02) ────────────────────
         "quinstreet",     # QuinStreet — performance marketing fintech; Greenhouse confirmed
     ]
@@ -3198,7 +3242,7 @@ _ULTIPRO_COMPANIES = {
     # ── Added 2026-04-02 — confirmed active PM/PO roles and remote eligibility ─
     "UNI1046UFMB/d8f90aad-672e-4f0a-bbc1-a17aa8cf1111": "Atlantic Union Bank",
     # Atlantic Union Bank: $20B+ regional bank headquartered in VA; posts remote
-    # digital PM/PO roles eligible in NC, VA, MD, PA, GA — adjust to your metro state.
+    # digital PM/PO roles eligible in NC, VA, MD, PA, GA. the user's local metro can be configured in config.py.
     # Confirmed: "Digital Product Manager" and "Digital Product Owner III" remote roles.
     "TEG1001TEGR/ad4204e8-c7f7-47f1-8177-c9f64730dccc": "InvestCloud",
     # InvestCloud: wealth management fintech platform; confirmed active PM role on
@@ -3708,7 +3752,7 @@ Description: {full_desc[:6000]}{salary_hint}
 Return ONLY a JSON object with exactly these three fields:
   "tier": one of exactly these four strings: "Perfect Fit", "Good Fit", "Worth a Look", "Skip"
   "reason": one sentence explaining the rating (mention the key match or the key gap)
-  "salary": the salary range exactly as stated in the description (e.g. "$120,000-$160,000", "$140K", "up to $175K") - use null if no salary is mentioned anywhere in the description
+  "salary": the salary range exactly as stated in the description (e.g. "$150,000-$180,000", "$160K", "up to $175K") - use null if no salary is mentioned anywhere in the description
 
 Tier guide:
 "Perfect Fit"  = 90-100% match. PM, PO, or BA role that aligns with the candidate's target domain and seniority. Right level, right domain, no hard disqualifiers. This is the strongest match category.
@@ -3719,7 +3763,7 @@ Tier guide:
   - On-site or hybrid with required office attendance OUTSIDE the candidate's local metro area. Read carefully - if the description says "hybrid" or "in-person" or "on-site" and the location is outside the target metro, Skip it. But if the description says "remote" as the primary arrangement and mentions in-person as optional or occasional, do NOT skip it. IMPORTANT: If the word "Remote" appears in the job TITLE itself (e.g., "Senior PM (Remote)", "Remote - Senior PM"), treat the role as remote regardless of what the Location field shows. Job boards like Adzuna often populate Location with the company's registered office address even for fully remote roles.
   - Staffing agency or contract-to-hire placement. Skip any role posted by a recruiting or staffing firm (Kforce, CyberCoders, Avenue Code, 1872 Consulting, Robert Half, Insight Global, Randstad, TEKsystems, etc.) OR any role explicitly described as contract, temp, or C2H regardless of who posts it.
   - Credit risk, underwriting, or loan origination as the PRIMARY function. IMPORTANT: "Servicing" and "collections" after origination (account management, payment plans, customer support for existing accounts) are NOT the same as origination or underwriting. Post-origination servicing is a valid target - do NOT skip it. Only skip if the role is about evaluating creditworthiness, approving loans, or originating new credit.
-  - Compensation range is entirely below MIN_SALARY (i.e. the TOP of the posted range is below your floor). A range like $140K-$180K should NOT be skipped — MIN_SALARY falls within that range. Only skip if the maximum listed salary is confirmed below your floor.
+  - Compensation range is entirely below $150K (i.e. the TOP of the posted range is below $150K). A range like $140K-$180K or $120K-$155K should NOT be skipped - $150K falls within both those ranges. Only skip if the maximum listed salary is confirmed below $150K.
   - Crypto, blockchain, or web3 as core product focus
   - AI product building as the PRIMARY function. Skip if: the company's core product IS an AI platform/tool, or the role's primary focus is owning/building AI features, AI roadmap, or AI-powered products. Examples of Skip: "own our AI assistant roadmap", "build LLM-powered features", "lead AI product strategy for our platform", "PM for our machine learning products". Do NOT skip if: AI is mentioned only as a tool the team uses internally, or the role is a standard PM role at a company that happens to use AI.
   - Non-US remote role - if a company is headquartered outside the US and the description does not explicitly state the role is open to US-based remote candidates, Skip it. European, Baltic, and UK banks hiring remotely are typically hiring within their own region.
@@ -3735,7 +3779,7 @@ CRITICAL RATING RULES - these override everything else:
 3. An incomplete or short job description is NEVER a reason to Skip. If the title fits and there are no confirmed hard disqualifiers, rate it Worth a Look or higher.
 4. "Cannot assess" or "impossible to evaluate" are NOT valid reasons to Skip. When in doubt, rate Worth a Look so the candidate can decide.
 5. Only Skip when you can CONFIRM a hard disqualifier is present - not when you merely suspect one might exist.
-6. CONSISTENCY RULE: If your reason sentence identifies a confirmed hard disqualifier (on-site outside the local metro, explicit people management required, crypto/blockchain, salary below MIN_SALARY, AI product building as primary, non-US location), your tier MUST be "Skip". Never return "Worth a Look" or "Good Fit" in the same response where you have confirmed a hard disqualifier. The reason and tier must agree.
+6. CONSISTENCY RULE: If your reason sentence identifies a confirmed hard disqualifier (on-site outside local metro, explicit people management required, crypto/blockchain, salary below $150K, AI product building as primary, non-US location), your tier MUST be "Skip". Never return "Worth a Look" or "Good Fit" in the same response where you have confirmed a hard disqualifier. The reason and tier must agree.
 
 JSON only. No other text."""
 
@@ -3868,19 +3912,19 @@ def clear_buffer():
 
 # ── LOCAL JOB DETECTOR ───────────────────────────────────────────────────────
 
-# RALEIGH_TERMS imported from config.py — set your own metro area cities there
+# LOCAL_METRO_TERMS imported from config.py — set your own metro area cities there
 
 def is_local_metro(job):
     """Returns True if the job appears to be on-site/hybrid in the user's local metro area.
-    Uses RALEIGH_TERMS from config.py — update that list with your own city and suburbs.
+    Uses LOCAL_METRO_TERMS from config.py — update that list with your own city and suburbs.
     """
     loc = job.get("location", "").lower()
     desc = job.get("description", "").lower()
     combined = loc + " " + desc[:500]  # check location + top of description
-    has_raleigh = any(t in combined for t in RALEIGH_TERMS)
+    has_local_metro = any(t in combined for t in LOCAL_METRO_TERMS)
     # Don't flag pure remote jobs - a job can mention RTP in a description and still be remote
     is_remote = "remote" in loc or (not loc and "remote" in desc[:200])
-    return has_raleigh and not is_remote
+    return has_local_metro and not is_remote
 
 # ── EMAIL ─────────────────────────────────────────────────────────────────────
 
@@ -4431,9 +4475,9 @@ def _run_pipeline(force_send, verbose, today, on_vacation, return_day,
         if is_non_us_location(j):
             rejected.append(j)
             _reject(j, "non_us_location")
-        elif is_onsite_non_raleigh(j):
+        elif is_onsite_outside_local_metro(j):
             rejected.append(j)
-            _reject(j, "onsite_non_raleigh")
+            _reject(j, "onsite_outside_local_metro")
         else:
             passing.append(j)
     raw = passing
