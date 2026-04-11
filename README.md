@@ -218,7 +218,7 @@ All runtime files live in `output/job-radar/` (gitignored). The radar keeps only
 
 ## Acknowledgements
 
-Special thanks to devpyle for the early help and inspiration that got this project off the ground.
+Special thanks to [devpyle](https://github.com/devpyle) for the early help and inspiration that got this project off the ground.
 
 ## Contact
 
