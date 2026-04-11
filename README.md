@@ -171,6 +171,11 @@ All runtime files live in `output/job-radar/` (gitignored). The radar keeps only
 | `radar_runs.db` | SQLite run history for the Health tab |
 | `debug_job_log.txt` | Full job log for debugging source quality |
 
+
+## Acknowledgements
+
+Special thanks to [devpyle](https://github.com/devpyle/) for the early help and inspiration that got this project off the ground.
+
 ## License
 
 MIT + Commons Clause. Free to use for personal job searching. Reach out before building anything commercial on top of it — see `LICENSE` for details.
