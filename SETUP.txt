@@ -102,7 +102,7 @@ The key things to update:
 
   PROFILE           Your name, current role, target roles, and career summary
   MIN_SALARY        Your minimum acceptable salary (number, e.g. 100000 for $100K)
-  RALEIGH_TERMS     Your city and surrounding metro area names
+  LOCAL_METRO_TERMS     Your city and surrounding metro area names
   COMPANIES         ATS company slugs for employers you want to track directly
   VACATION_START    Set to a past date if you are not on vacation
   VACATION_END      Set to a past date if you are not on vacation
@@ -190,7 +190,7 @@ LOCATION FILTER — CITIES TO BLOCK
   regardless of what these lists contain.
 
 YOUR LOCAL METRO AREA
-  File: scripts/config.py — variable: RALEIGH_TERMS
+  File: scripts/config.py — variable: LOCAL_METRO_TERMS
   A set of city and suburb names that define your local commutable area. The
   radar uses this to identify local hybrid/onsite roles and show them in a
   separate section of your daily email. Replace the example values with your
@@ -245,13 +245,38 @@ You can do multiple rounds — start with the basics (profile, city, titles)
 and iterate from there. The AI can also help you debug if something goes
 wrong, add new features, or explain what any part of the code does.
 
+THINGS YOU WILL NEED AI TO HELP YOU UPDATE
+  config.py:
+    PROFILE              Rewrite with your name, background, target roles,
+                         strengths, and hard constraints
+    LOCAL_METRO_TERMS    Replace placeholders with your city and suburbs
+    MIN_SALARY           Your salary floor as a plain number
+    All query lists      ADZUNA_QUERIES, BRAVE_QUERIES, TAVILY_QUERIES,
+                         LI_REMOTE_QUERIES, LI_LOCAL_QUERIES,
+                         HIMALAYAS_QUERIES, REMOTIVE_QUERIES, JOBICY_QUERIES
+                         Replace [Your Role] and [Your Industry] placeholders
+
+  job_radar.py:
+    TARGET_TITLES        Keywords matching your target job titles — critical,
+                         anything that doesn't match is dropped immediately
+    HARD_DISQUALIFIERS   Phrases for things you never want to see
+    SALARY_FLOOR_EXEMPT  Employers you trust to pay above your floor
+    _URL_CITY_RE         Remove cities near you from the block list
+    _LOC_CITY_RE         Same — location field version of the city filter
+    Claude rating prompt Rewrite tier definitions for your situation
+
 QUICK-START VIBE CODE PROMPTS
 
 Getting set up for a different role type:
   "I've attached job_radar.py and config.example.py. I'm a [your role] looking
-  for [target roles] in the [your city] area. Can you update TARGET_TITLES,
-  set RALEIGH_TERMS to match [your metro area], and rewrite the PROFILE block
-  to describe my background: [brief summary of your experience]?"
+  for [target roles] in the [your city] area. Can you:
+  - Update TARGET_TITLES for my role type
+  - Set LOCAL_METRO_TERMS to my metro (city and nearby suburbs: [list them])
+  - Fill in all the search query lists (ADZUNA_QUERIES, BRAVE_QUERIES,
+    TAVILY_QUERIES, LI_REMOTE_QUERIES, LI_LOCAL_QUERIES, HIMALAYAS_QUERIES,
+    REMOTIVE_QUERIES, JOBICY_QUERIES) with my actual target titles and industry
+  - Rewrite the PROFILE block for my background: [brief summary]
+  - Rewrite the Claude rating prompt tier definitions for my situation"
 
 Adding hard filters:
   "I want to automatically skip jobs that mention [thing you hate], [industry
@@ -345,7 +370,7 @@ I need query lists for these variables:
   BRAVE_QUERIES      (8-12 queries, written like natural search phrases)
   TAVILY_QUERIES     (8-12 queries, written like natural search phrases)
   LI_REMOTE_QUERIES  (8-12 short keyword queries for LinkedIn remote searches)
-  LI_RALEIGH_QUERIES (5-8 queries that include your city name for local searches)
+  LI_LOCAL_QUERIES (5-8 queries that include your city name for local searches)
 
 Please write these as Python lists I can paste directly into my config.py.
 ---
