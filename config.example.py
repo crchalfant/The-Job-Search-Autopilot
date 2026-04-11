@@ -40,7 +40,7 @@ Target roles: Senior Product Manager, Senior Product Owner, Lead/Principal PM,
               AVP Product, Director of Product (IC), Senior Business Analyst,
               Customer Experience Manager
 
-Target salary: $150K+
+Target salary: $xxxx
 Location: Remote (nationwide) OR on-site/hybrid in [Your City] area only
 """
 
