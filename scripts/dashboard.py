@@ -1592,7 +1592,7 @@ BOARD_HTML = r"""<!DOCTYPE html>
       <span>Reviewing <strong id="count-reviewing">–</strong></span>
     </div>
     <div class="stat-chip">
-      <div class="stat-dot" style="background:var(--applied)"></div>
+      <div class="stat-dot" style="background:var(--good)"></div>
       <span>Applied <strong id="count-applied">–</strong></span>
     </div>
     <div class="stat-chip">
