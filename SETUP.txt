@@ -2,7 +2,7 @@
 JOB SEARCH AUTOPILOT - SETUP GUIDE
 ================================================================================
 
-A personal job search automation tool that searches 11 sources daily, rates
+A personal job search automation tool that searches 12 sources daily, rates
 every listing with Claude AI, and emails you a ranked digest each morning.
 
 This file is the deep-dive companion to README.md. It covers step-by-step

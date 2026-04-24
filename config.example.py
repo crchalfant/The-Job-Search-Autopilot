@@ -10,9 +10,8 @@ Required environment variables (set in .env or system environment):
     TAVILY_API_KEY      — from app.tavily.com (free tier available)
     ADZUNA_APP_ID       — from developer.adzuna.com (free)
     ADZUNA_APP_KEY      — from developer.adzuna.com (free)
-    EMAIL_FROM          — Gmail address used to send the digest
-    EMAIL_PASSWORD      — Gmail App Password (not your login password)
-    EMAIL_TO            — Address that receives the digest (can be same as FROM)
+    GMAIL_ADDRESS       — Gmail address used to send the digest
+    GMAIL_APP_PW        — Gmail App Password (not your login password)
     USAJOBS_API_KEY     — from developer.usajobs.gov (free, optional)
     USAJOBS_EMAIL       — your email, required by USAJobs API (optional)
 """

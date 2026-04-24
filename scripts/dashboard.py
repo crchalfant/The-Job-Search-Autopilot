@@ -54,7 +54,7 @@ import glob
 import sqlite3
 import threading
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template_string, send_from_directory
+from flask import Flask, jsonify, request, render_template_string
 
 from radar_shared import atomic_write_json, make_job_id, safe_json_load
 
@@ -568,7 +568,7 @@ def api_unflag():
 @app.route("/api/health")
 def api_health():
     """Return radar run history from SQLite for the Health tab.
-    Returns the last 30 runs with per-source stats and filter breakdown.
+    Returns the last 90 runs with per-source stats and filter breakdown.
     Returns empty runs list if DB does not exist yet (no runs completed).
     """
     if not os.path.exists(RADAR_DB):
@@ -995,7 +995,7 @@ BOARD_HTML = r"""<!DOCTYPE html>
     border-radius: 2px;
   }
   .reviewing-accent   { background: var(--accent); }
-  .applied-accent     { background: var(--applied); }
+  .applied-accent     { background: var(--good); }
   .interviewing-accent{ background: var(--interview); }
 
   .cards {
@@ -2513,7 +2513,7 @@ def _prune_board_state():
         jid for jid, s in state.items()
         if s.get("skip_dismissed")          # only skipped-tab dismissals
         and not s.get("rejected")           # never touch board rejections
-        and not s.get("flagged")            # keep flagged entriesed entries
+        and not s.get("flagged")            # keep flagged entries
         and not s.get("applied_date")       # keep anything with applied date
         and not s.get("column")             # keep anything moved to a column
         and not s.get("restored")           # keep restored jobs

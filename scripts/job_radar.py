@@ -99,11 +99,7 @@ except ModuleNotFoundError:
 # startup errors rather than cryptic failures deep in the pipeline.
 try:
     import config as _config_module
-<<<<<<< HEAD
     from radar_shared import validate_user_config, make_job_id, normalize_title as _normalize_title_shared
-=======
-    from radar_shared import validate_user_config
->>>>>>> 1c5e77b7a8ada0bd6ef9c94728bbb7f3e8cb4126
     validate_user_config(_config_module)
 except ValueError as _cfg_err:
     raise SystemExit(f"\nERROR: Invalid config.py value — {_cfg_err}\n")

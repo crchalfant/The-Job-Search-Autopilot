@@ -115,7 +115,9 @@ def safe_json_load(path: str, *, default: Any, expected_type: type | tuple[type,
 
 
 def atomic_write_json(path: str, data: Any, *, indent: int = 2) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    dirpath = os.path.dirname(path)
+    if dirpath:
+        os.makedirs(dirpath, exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=indent)

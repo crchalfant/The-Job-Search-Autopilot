@@ -2,7 +2,7 @@
 
 A personal job search automation tool — and a practical introduction to vibe coding.
 
-This project does two things. It runs every morning, searches 11 job sources, rates every listing with Claude AI, and emails you a ranked digest. And it's designed so that anyone — developer or not — can pick it up, describe what they want to an AI, and make it their own without writing code from scratch.
+This project does two things. It runs every morning, searches 12 job sources, rates every listing with Claude AI, and emails you a ranked digest. And it's designed so that anyone — developer or not — can pick it up, describe what they want to an AI, and make it their own without writing code from scratch.
 
 If you're job hunting, it saves you hours of manual searching. If you're new to AI-assisted development, it's a real working project you can learn on.
 
@@ -25,7 +25,7 @@ If you're job hunting, it saves you hours of manual searching. If you're new to 
 
 ## What it does
 
-- Searches 11 sources: ATS direct (Greenhouse/Lever/Ashby), Adzuna, LinkedIn, Brave, Tavily, WeWorkRemotely, Jobicy, Himalayas, Remotive, USAJobs, UltiPro/UKG
+- Searches 12 sources: ATS direct (Greenhouse/Lever/Ashby), Adzuna, LinkedIn, Brave, Tavily, WeWorkRemotely, Jobicy, Himalayas, Remotive, USAJobs, UltiPro/UKG, RemoteOK
 - Filters out non-US roles, onsite roles outside your metro, below-salary-floor postings, staffing agencies, and noise pages
 - Rates each job with Claude AI (Perfect Fit / Good Fit / Worth a Look / Skip) based on your profile
 - Emails a daily digest sorted by tier
