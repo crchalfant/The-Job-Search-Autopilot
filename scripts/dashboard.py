@@ -336,6 +336,17 @@ def api_board():
             if jid in skipped_by_id:
                 jobs.append(skipped_by_id[jid])
 
+    # FIX: Jobs moved to Applied/Interviewing can disappear after *-jobs.json
+    # files are pruned (KEEP_RUNS=3 days). If a job_id is in board_state with
+    # a pinned_job snapshot but is no longer in any *-jobs.json file, inject
+    # the pinned snapshot back so the card stays visible on the board.
+    for jid, s in state.items():
+        if s.get("pinned_job") and s.get("column") and not s.get("rejected"):
+            if jid not in jobs_by_id:
+                pinned = dict(s["pinned_job"])
+                jobs.append(pinned)
+                jobs_by_id[jid] = pinned
+
     board  = build_board(jobs, state)
     total  = sum(len(v) for v in board.values())
     return jsonify({
@@ -347,7 +358,13 @@ def api_board():
 
 @app.route("/api/move", methods=["POST"])
 def api_move():
-    """Move a card to a different column."""
+    """Move a card to a different column.
+
+    When a job is moved out of Reviewing (i.e. to Applied or Interviewing),
+    we snapshot its core display fields into board_state.json. This ensures
+    the card survives the daily *-jobs.json file pruning (KEEP_RUNS=3) and
+    never disappears from the board just because its source file was deleted.
+    """
     data   = _payload_dict()
     job_id = _validated_job_id(data)
     column = _validated_column(data)
@@ -362,6 +379,29 @@ def api_move():
         state[job_id]["column"] = column
         if column == "Applied" and not state[job_id].get("applied_date"):
             state[job_id]["applied_date"] = datetime.now().strftime("%Y-%m-%d")
+
+        # Persist job data so the card survives *-jobs.json pruning.
+        # Only snapshot fields needed for display — skip large description.
+        # job_data is sent by the frontend when dragging a card.
+        job_data = data.get("job") if isinstance(data.get("job"), dict) else {}
+        if job_data and column in ("Applied", "Interviewing"):
+            pinned = state[job_id].get("pinned_job", {})
+            # Only write once — don't overwrite with a stale copy on subsequent moves
+            if not pinned:
+                state[job_id]["pinned_job"] = {
+                    "title":            job_data.get("title", ""),
+                    "company":          job_data.get("company", ""),
+                    "location":         job_data.get("location", ""),
+                    "url":              job_data.get("url", ""),
+                    "source":           job_data.get("source", ""),
+                    "tier":             job_data.get("tier", ""),
+                    "reason":           job_data.get("reason", ""),
+                    "salary_min":       job_data.get("salary_min", 0),
+                    "salary_max":       job_data.get("salary_max", 0),
+                    "salary_extracted": job_data.get("salary_extracted", ""),
+                    "date_found":       job_data.get("date_found", ""),
+                }
+
         try:
             save_board_state(state)
         except OSError as e:
@@ -2386,7 +2426,7 @@ async function moveCard(cardId, column) {
     const resp = await fetch('/api/move', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({id, column}),
+      body: JSON.stringify({id, column, job: job || null}),
     });
     if (!resp.ok) { showToast('Error moving card — try again'); return; }
     showToast(`Moved to ${column}`);

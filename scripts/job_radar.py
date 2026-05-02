@@ -88,6 +88,7 @@ try:
         ADZUNA_QUERIES, BRAVE_QUERIES, TAVILY_QUERIES,
         LI_REMOTE_QUERIES, LI_LOCAL_QUERIES,
         HIMALAYAS_QUERIES, REMOTIVE_QUERIES, USAJOBS_QUERIES, JOBICY_QUERIES,
+        HARD_DISQUALIFIERS, HARD_DISQ_PATTERN, COMPANY_PREFILTER, WRONG_TITLE_PATTERNS,
     )
 except ModuleNotFoundError:
     raise SystemExit(
@@ -307,25 +308,9 @@ DOMAIN_COMPANY_MAP: dict = {
 # FIX (code review): Changed from list to frozenset.
 # Only used for `term in HARD_DISQUALIFIERS` membership tests — frozenset gives
 # O(1) lookup vs O(n) list scan, and documents intent: these are unique, unordered terms.
-HARD_DISQUALIFIERS = frozenset([
-    # Add phrases that should ALWAYS disqualify a job regardless of context.
-    # Keep this list SHORT — only terms that are 100% unambiguous.
-    # Everything else is better handled by Claude, which can read context.
-    # Example domain-specific terms to add for your field:
-    #   "blockchain", "web3", "cryptocurrency", "nft", "smart contract"
-    #   "merchant cash advance", "loan origination"
-    # Staffing agency description phrases — recruiter posting on behalf of a client
-    "on behalf of our client",
-    "on behalf of a client",
-    "our client is looking",
-    "our client is seeking",
-])
-
-# Separate regex-based disqualifiers that need word boundary matching.
-# Add patterns here for terms where substring matching would cause false positives.
-# Example: r"\bdefi\b|\bcrypto\b" would match "defi" but not "define" or "definitely".
-# Set to a pattern that never matches if you have no regex disqualifiers.
-_HARD_DISQ_RE = re.compile(r"(?!)", re.IGNORECASE)  # no-op by default — add patterns as needed
+# HARD_DISQUALIFIERS and HARD_DISQ_PATTERN imported from config.py
+# Compiled here so the regex is built once at startup.
+_HARD_DISQ_RE = re.compile(HARD_DISQ_PATTERN, re.IGNORECASE)
 
 def has_disqualifier(job):
     """
@@ -370,19 +355,7 @@ def has_disqualifier(job):
 # To re-enable a company: comment or remove its entry below.
 # To add a new company: add "substring": ("category", "reason") — substring match,
 # case-insensitive. Keep substrings specific enough to avoid false positives.
-_COMPANY_PREFILTER = {
-    # ── Staffing agencies — never pass to Claude ──────────────────────────────
-    # Add staffing/recruiting firms you keep seeing in your results.
-    # Format: "company name substring": ("category", "reason string")
-    # Substring match is case-insensitive. Keep substrings specific enough to
-    # avoid false positives (e.g. "ramp talent" not just "ramp").
-    "jobgether":      ("staffing", "Jobgether posts on behalf of partner companies — staffing agency hard disqualifier"),
-    "insight global": ("staffing", "Insight Global is a staffing/recruiting firm — hard disqualifier"),
-    "apex systems":   ("staffing", "Apex Systems is a staffing/IT recruiting firm — hard disqualifier"),
-    "ladders":        ("aggregator", "Ladders is a job aggregator that reposts listings — not a direct employer"),
-    # Add more as you encounter them:
-    # "agency name": ("staffing", "Reason it is always Skip"),
-}
+_COMPANY_PREFILTER = COMPANY_PREFILTER  # imported from config.py
 
 def is_company_prefilter(job):
     """
@@ -431,10 +404,9 @@ def is_company_prefilter(job):
 #   r"|\bsales (manager|executive|rep)\b"     # wrong function
 #
 # ─────────────────────────────────────────────────────────────────────────────
-_WRONG_TITLE_RE = re.compile(
-    r"(?!)",   # placeholder — matches nothing; replace with your own patterns
-    re.IGNORECASE,
-)
+# _WRONG_TITLE_RE built from WRONG_TITLE_PATTERNS imported from config.py
+# Patterns are joined with | and compiled once at startup.
+_WRONG_TITLE_RE = re.compile("|".join(WRONG_TITLE_PATTERNS), re.IGNORECASE)
 
 def is_wrong_title(job):
     title = job.get("title", "").lower()
