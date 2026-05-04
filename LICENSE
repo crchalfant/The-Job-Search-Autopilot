@@ -50,12 +50,17 @@ GitHub:  https://github.com/crchalfant
 Any license notice or attribution required by the License must also include
 this Commons Clause restriction notice.
 
+Attribution: If you fork, adapt, or redistribute this Software, you must
+include the original copyright notice and a link to the original repository
+(https://github.com/crchalfant/job-search-autopilot or equivalent).
+
 ---
 
 Summary
 
   ✓ Free to use for personal job searching
-  ✓ Free to fork, modify, and share with others
+  ✓ Free to fork, modify, and share with others (with attribution)
   ✓ Free to adapt for your own non-commercial use
   ✗ Not free to sell, commercialize, or build a paid product on top of without
     reaching out to Casey Chalfant first
+  ✗ Not free to redistribute without crediting the original repository
